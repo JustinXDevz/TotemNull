@@ -13,8 +13,8 @@ import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
 import org.bukkit.Material;
-import org.bukkit.MusicInstrument;
 import org.bukkit.NamespacedKey;
+import org.bukkit.Registry;
 import org.bukkit.Sound;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
@@ -127,7 +127,10 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
     private boolean isCallHorn(ItemStack item) {
         if (item == null || item.getType() != Material.GOAT_HORN || !item.hasItemMeta()) return false;
         ItemMeta meta = item.getItemMeta();
-        if (meta instanceof MusicInstrumentMeta mim && MusicInstrument.CALL.equals(mim.getInstrument())) return true;
+        if (meta instanceof MusicInstrumentMeta mim && mim.getInstrument() != null) {
+            NamespacedKey key = Registry.INSTRUMENT.getKey(mim.getInstrument());
+            if (key != null && key.getKey().equals("call")) return true;
+        }
         if (meta.hasDisplayName()) {
             String name = PlainTextComponentSerializer.plainText().serialize(meta.displayName());
             return name.trim().equalsIgnoreCase("call");
@@ -288,4 +291,4 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
     public void onDeath(PlayerDeathEvent e) {
         dismiss(e.getPlayer().getUniqueId(), false);
     }
-          }
+}
