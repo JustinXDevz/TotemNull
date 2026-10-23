@@ -1,0 +1,7 @@
+# Pitch-black skin for the NULL army.
+# 1. Upload null_skin.png at https://mineskin.org (classic/steve model is fine).
+# 2. Copy the "value" and "signature" it gives you into the two lines below.
+# 3. Restart the server (or reload the plugin).
+skin:
+  value: ""
+  signature: ""
