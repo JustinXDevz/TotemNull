@@ -84,6 +84,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         registry = CitizensAPI.createAnonymousNPCRegistry(new MemoryNPCDataStore());
         getServer().getPluginManager().registerEvents(this, this);
         getCommand("totemnull").setExecutor(this);
+        getCommand("nullcall").setExecutor(this);
     }
 
     @Override
@@ -92,9 +93,20 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         if (registry != null) registry.deregisterAll();
     }
 
-    // ---------- command ----------
+    // ---------- commands ----------
     @Override
     public boolean onCommand(CommandSender sender, Command cmd, String label, String[] args) {
+        // /nullcall: same as blowing the horn, works on Java and Bedrock
+        if (cmd.getName().equalsIgnoreCase("nullcall")) {
+            if (sender instanceof Player caller) {
+                toggle(caller, true);
+            } else {
+                sender.sendMessage("Players only.");
+            }
+            return true;
+        }
+
+        // /totemnull [player]: give the totem
         Player target;
         if (args.length > 0) {
             target = Bukkit.getPlayerExact(args[0]);
@@ -119,7 +131,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         ItemMeta meta = item.getItemMeta();
         meta.displayName(Component.text("Totem of NULL", NamedTextColor.DARK_GRAY, TextDecoration.BOLD)
                 .decoration(TextDecoration.ITALIC, false));
-        meta.lore(List.of(Component.text("Blow the Call horn to command NULL.", NamedTextColor.GRAY)
+        meta.lore(List.of(Component.text("Blow the Call horn or use /nullcall.", NamedTextColor.GRAY)
                 .decoration(TextDecoration.ITALIC, false)));
         meta.getPersistentDataContainer().set(totemKey, PersistentDataType.BYTE, (byte) 1);
         item.setItemMeta(meta);
@@ -213,16 +225,33 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         return liveTarget(owner, id);
     }
 
-    // ---------- horn: blow once = summon, blow again = vanish ----------
+    // ---------- horn / command: summon once, again = vanish ----------
     @EventHandler
     public void onHorn(PlayerInteractEvent e) {
-        if (e.getAction() != Action.RIGHT_CLICK_AIR && e.getAction() != Action.RIGHT_CLICK_BLOCK) return;
-        if (!isCallHorn(e.getItem())) return;
+        ItemStack item = e.getItem();
+        if (item == null || item.getType() != Material.GOAT_HORN) return;
 
         Player owner = e.getPlayer();
-        if (!hasTotem(owner)) return;
+        boolean callHorn = isCallHorn(item);
 
+        if (getConfig().getBoolean("debug", true)) {
+            getLogger().info("[debug] " + owner.getName() + " goat horn click: action=" + e.getAction()
+                    + " hand=" + e.getHand() + " callHorn=" + callHorn + " totem=" + hasTotem(owner));
+        }
+
+        boolean rightClick = e.getAction() == Action.RIGHT_CLICK_AIR || e.getAction() == Action.RIGHT_CLICK_BLOCK;
+        boolean anyHorn = getConfig().getBoolean("army.any-horn", false);
+        if (!rightClick || !(callHorn || anyHorn)) return;
+
+        toggle(owner, false);
+    }
+
+    private void toggle(Player owner, boolean notify) {
         UUID id = owner.getUniqueId();
+        if (!hasTotem(owner)) {
+            if (notify) owner.sendActionBar(Component.text("You need the Totem of NULL.", NamedTextColor.RED));
+            return;
+        }
         long now = System.currentTimeMillis();
         if (now - lastHorn.getOrDefault(id, 0L) < HORN_DEBOUNCE_MS) return;
         lastHorn.put(id, now);
@@ -483,4 +512,4 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
     public void onDeath(PlayerDeathEvent e) {
         dismiss(e.getPlayer().getUniqueId(), false);
     }
-            }
+    }
