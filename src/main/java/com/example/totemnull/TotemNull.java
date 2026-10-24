@@ -162,6 +162,8 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         final Map<NPC, Location> lastPos = new HashMap<>();
         final Map<NPC, Location> lastDest = new HashMap<>();
         final Map<NPC, Integer> stuck = new HashMap<>();
+        final Map<NPC, Integer> idle = new HashMap<>();          // checks in a row where it could do nothing about being stuck
+        final Map<NPC, Long> climbUntil = new HashMap<>();       // stacking blocks upward: keep going without pausing
         final Map<NPC, Long> lastShot = new HashMap<>();
         final Map<NPC, Location> focus = new HashMap<>();   // block an NPC is working on
         final Map<NPC, Long> busyUntil = new HashMap<>();
@@ -1014,6 +1016,8 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
 
         army.engaged.remove(dead);
         army.stuck.remove(dead);
+        army.idle.remove(dead);
+        army.climbUntil.remove(dead);
         army.lastPos.remove(dead);
         army.lastDest.remove(dead);
         army.focus.remove(dead);
@@ -1066,6 +1070,9 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
             command(owner, army, null);                 // target died / left
         }
 
+        long now = System.currentTimeMillis();
+        boolean breakOn = getConfig().getBoolean("army.break-blocks", true);
+
         for (NPC npc : army.npcs) {
             if (!npc.isSpawned()) continue;
             if (army.flights.containsKey(npc)) continue;   // in the air: flightTick drives it
@@ -1077,6 +1084,13 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
                 continue;
             }
 
+            // still stacking blocks up to a target above: keep going, no pause between blocks
+            Long climbing = army.climbUntil.get(npc);
+            if (target != null && climbing != null && now < climbing
+                    && shouldClimb(here, target) && pillar(owner, army, npc, here, breakOn)) {
+                continue;
+            }
+
             steerOne(owner, army, npc, target);
             if (target != null) {
                 checkStuck(owner, army, npc, here, target.getLocation(), target, 9);
@@ -1085,6 +1099,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
                 checkStuck(owner, army, npc, here, slot(army, army.rally, idx, false), null, 4);
             } else {
                 army.stuck.remove(npc);
+                army.idle.remove(npc);
                 army.lastPos.remove(npc);
             }
         }
@@ -1300,6 +1315,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
             army.lastDest.remove(n);
             army.lastPos.remove(n);
             army.stuck.remove(n);
+            army.idle.remove(n);
         }
     }
 
@@ -1474,6 +1490,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         army.engaged.remove(npc);
         army.lastDest.remove(npc);
         army.stuck.remove(npc);
+        army.idle.remove(npc);
         equipStyle(npc, true);
 
         Flight f = new Flight();
@@ -1583,6 +1600,16 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
             l.subtract(0, 1, 0);
         }
         return from.clone();
+    }
+
+    // like groundBelow, but null if there is nothing solid to stand on within 12 blocks
+    private Location solidGroundBelow(Location from) {
+        Location l = from.clone();
+        for (int i = 0; i < 12; i++) {
+            if (l.getBlock().getRelative(BlockFace.DOWN).getType().isSolid()) return l;
+            l.subtract(0, 1, 0);
+        }
+        return null;
     }
 
     // landed (or crashed): back on the ground, switch back to the normal style
@@ -1713,6 +1740,19 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         }
     }
 
+    // should this NULL stack blocks upward to reach the target? only if it is standing, nearly overhead, and not too high
+    private boolean shouldClimb(Location here, LivingEntity target) {
+        if (!here.getWorld().equals(target.getWorld())) return false;
+        Location t = target.getLocation();
+        double dy = t.getY() - here.getY();
+        double max = getConfig().getDouble("army.pillar-max-height", 30.0);
+        if (dy < 1.5 || dy > max) return false;
+        if (!target.isOnGround()) return false;            // a flying target can't be reached by stacking blocks
+        double dx = t.getX() - here.getX();
+        double dz = t.getZ() - here.getZ();
+        return dx * dx + dz * dz <= 64;                    // only when it is nearly overhead
+    }
+
     // is this NPC stuck on its way to <to>? if so, start digging / bridging / pillaring
     private void checkStuck(Player owner, Army army, NPC npc, Location here, Location to,
                             LivingEntity target, double nearSq) {
@@ -1730,84 +1770,133 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         if (target != null && army.roles.get(npc) == Role.ARCHER && npc.getEntity() instanceof LivingEntity me
                 && here.distanceSquared(to) <= ARCHER_RANGE * ARCHER_RANGE && me.hasLineOfSight(target)) {
             army.stuck.put(npc, 0);
+            army.idle.put(npc, 0);
             return;
         }
         if (here.distanceSquared(to) <= nearSq) {     // close enough: fighting or arrived
             army.stuck.put(npc, 0);
+            army.idle.put(npc, 0);
             return;
         }
         boolean moved = last != null && last.getWorld().equals(here.getWorld())
                 && last.distanceSquared(here) > 0.04;
         if (moved) {
             army.stuck.put(npc, 0);
+            army.idle.put(npc, 0);
             return;
         }
         int stuckFor = army.stuck.merge(npc, 1, Integer::sum);
         if (stuckFor < 2) return;                     // no movement for about half a second
 
-        clearPath(owner, army, npc, here, to);        // keeps working every check while still blocked
+        if (clearPath(owner, army, npc, here, to, target)) {   // dug, bridged or stacked something
+            army.idle.put(npc, 0);
+            return;
+        }
+
+        // nothing it could do about being stuck: after a few seconds, pop it next to the target
+        int idleChecks = army.idle.merge(npc, 1, Integer::sum);
+        double secs = getConfig().getDouble("army.stuck-teleport-seconds", 6.0);
+        if (secs > 0 && idleChecks * TICK >= secs * 20) {
+            rescue(army, npc, to);
+            army.idle.put(npc, 0);
+            army.stuck.put(npc, 0);
+        }
     }
 
-    // blocked NPC: dig a tunnel, bridge a gap, pillar up or dig down (fast)
-    private void clearPath(Player owner, Army army, NPC npc, Location here, Location to) {
+    // teleports a hopelessly stuck NULL next to where it was heading (if there is ground there)
+    private void rescue(Army army, NPC npc, Location to) {
+        Location ground = solidGroundBelow(to);
+        if (ground == null) return;
+        Location spot = ground.clone().add(1.5, 0, 0);
+        if (!spot.getBlock().isPassable() || !spot.clone().add(0, 1, 0).getBlock().isPassable()) spot = ground;
+
+        Location from = npc.getEntity().getLocation();
+        from.getWorld().spawnParticle(Particle.PORTAL, from.clone().add(0, 1, 0), 30, 0.3, 0.6, 0.3, 0.2);
+        npc.teleport(spot, PlayerTeleportEvent.TeleportCause.PLUGIN);
+        spot.getWorld().spawnParticle(Particle.PORTAL, spot.clone().add(0, 1, 0), 30, 0.3, 0.6, 0.3, 0.2);
+        army.lastDest.remove(npc);
+        army.engaged.remove(npc);
+    }
+
+    // blocked NPC: dig a tunnel, bridge a gap, stack blocks up or dig down. true = it did something
+    private boolean clearPath(Player owner, Army army, NPC npc, Location here, Location to, LivingEntity target) {
         boolean breakOn = getConfig().getBoolean("army.break-blocks", true);
         boolean placeOn = getConfig().getBoolean("army.place-blocks", true);
 
         double dx = to.getX() - here.getX();
         double dz = to.getZ() - here.getZ();
         double dy = to.getY() - here.getY();
-        BlockFace face = Math.abs(dx) > Math.abs(dz)
-                ? (dx > 0 ? BlockFace.EAST : BlockFace.WEST)
-                : (dz > 0 ? BlockFace.SOUTH : BlockFace.NORTH);
+        boolean xFirst = Math.abs(dx) > Math.abs(dz);
+        BlockFace primary = xFirst ? (dx > 0 ? BlockFace.EAST : BlockFace.WEST)
+                                   : (dz > 0 ? BlockFace.SOUTH : BlockFace.NORTH);
+        BlockFace secondary = xFirst ? (dz > 0 ? BlockFace.SOUTH : BlockFace.NORTH)
+                                     : (dx > 0 ? BlockFace.EAST : BlockFace.WEST);
+        boolean useSecondary = Math.min(Math.abs(dx), Math.abs(dz)) >= 1.5;
 
         Block feet = here.getBlock();
-        Block front = feet.getRelative(face);
-        Block frontHead = front.getRelative(BlockFace.UP);
-        Block front2 = front.getRelative(face);
-        Block front2Head = front2.getRelative(BlockFace.UP);
+        boolean canClimb = target != null
+                ? shouldClimb(here, target)
+                : (dy >= 1.5 && dy <= getConfig().getDouble("army.pillar-max-height", 30.0));
 
-        // 1) wall ahead: dig a two-block-deep tunnel in one go
-        if (!front.isPassable() || !frontHead.isPassable() || !front2.isPassable() || !front2Head.isPassable()) {
-            if (breakOn) {
-                boolean did = false;
-                boolean makeSound = true;
-                for (Block b : new Block[]{frontHead, front, front2Head, front2}) {
-                    if (b.isPassable()) continue;
-                    if (breakBlock(owner, b, makeSound)) {
-                        did = true;
-                        makeSound = false;
-                    }
-                }
-                if (did) {
-                    showWork(army, npc, front);
-                    return;
-                }
-            }
-            if (dy >= 1.5 && placeOn) pillar(owner, army, npc, here, breakOn);
-            return;
+        // 1) wall ahead: dig a two-block-deep tunnel; if that side can't be dug, try the other direction
+        BlockFace[] tries = useSecondary ? new BlockFace[]{primary, secondary} : new BlockFace[]{primary};
+        boolean walled = false;
+        for (BlockFace face : tries) {
+            Block front = feet.getRelative(face);
+            Block frontHead = front.getRelative(BlockFace.UP);
+            Block front2 = front.getRelative(face);
+            Block front2Head = front2.getRelative(BlockFace.UP);
+            boolean wall = !front.isPassable() || !frontHead.isPassable()
+                    || !front2.isPassable() || !front2Head.isPassable();
+            if (!wall) continue;
+            walled = true;
+            if (breakOn && dig(owner, army, npc, front, frontHead, front2, front2Head)) return true;
+        }
+        if (walled) {
+            // could not dig through: go up and over if the target is above
+            return canClimb && placeOn && pillar(owner, army, npc, here, breakOn);
         }
 
         // 2) gap ahead: bridge two blocks at once
+        Block front = feet.getRelative(primary);
+        Block front2 = front.getRelative(primary);
         Block groundFront = front.getRelative(BlockFace.DOWN);
         if (placeOn && dy > -2 && !groundFront.getType().isSolid()) {
             boolean did = placeBlock(army, groundFront);
             Block groundFront2 = front2.getRelative(BlockFace.DOWN);
             if (!groundFront2.getType().isSolid()) did |= placeBlock(army, groundFront2);
             if (did) showWork(army, npc, groundFront);
-            return;
+            return did;
         }
 
-        // 3) target is higher: pillar up
-        if (dy >= 1.5 && placeOn) {
-            pillar(owner, army, npc, here, breakOn);
-            return;
+        // 3) target is above and reachable by stacking blocks
+        if (canClimb && placeOn) {
+            return pillar(owner, army, npc, here, breakOn);
         }
 
         // 4) target is far below: dig down
         if (dy <= -2.5 && breakOn) {
             Block below = feet.getRelative(BlockFace.DOWN);
-            if (breakBlock(owner, below, true)) showWork(army, npc, below);
+            if (breakBlock(owner, below, true)) {
+                showWork(army, npc, below);
+                return true;
+            }
         }
+        return false;
+    }
+
+    private boolean dig(Player owner, Army army, NPC npc, Block front, Block frontHead, Block front2, Block front2Head) {
+        boolean did = false;
+        boolean makeSound = true;
+        for (Block b : new Block[]{frontHead, front, front2Head, front2}) {
+            if (b.isPassable()) continue;
+            if (breakBlock(owner, b, makeSound)) {
+                did = true;
+                makeSound = false;
+            }
+        }
+        if (did) showWork(army, npc, front);
+        return did;
     }
 
     // arm swing + eyes on the block it is working on
@@ -1821,16 +1910,19 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         }
     }
 
-    private void pillar(Player owner, Army army, NPC npc, Location here, boolean breakOn) {
+    // places a block under the NULL and lifts it one block up (true = it went up)
+    private boolean pillar(Player owner, Army army, NPC npc, Location here, boolean breakOn) {
         Block feet = here.getBlock();
         Block above2 = feet.getRelative(BlockFace.UP, 2);
         if (!above2.isPassable()) {
-            if (!breakOn || !breakBlock(owner, above2, true)) return;
+            if (!breakOn || !breakBlock(owner, above2, true)) return false;
         }
-        if (placeBlock(army, feet)) {
-            npc.teleport(here.clone().add(0, 1, 0), PlayerTeleportEvent.TeleportCause.PLUGIN);
-            showWork(army, npc, feet);
-        }
+        if (!placeBlock(army, feet)) return false;
+
+        npc.teleport(here.clone().add(0, 1, 0), PlayerTeleportEvent.TeleportCause.PLUGIN);
+        army.climbUntil.put(npc, System.currentTimeMillis() + 700);   // keep going on the next check
+        showWork(army, npc, feet);
+        return true;
     }
 
     private boolean breakBlock(Player owner, Block b, boolean makeSound) {
@@ -1853,8 +1945,12 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
     }
 
     private boolean placeBlock(Army army, Block b) {
-        if (army.placed.size() >= 300) return false;
-        if (!(b.getType().isAir() || b.isLiquid())) return false;
+        int cap = getConfig().getInt("army.max-placed-blocks", 1500);
+        if (army.placed.size() >= cap) return false;
+
+        Material cur = b.getType();
+        boolean soft = b.isPassable() && !cur.isAir() && cur.getHardness() <= 0.2f; // grass, flowers, snow layers
+        if (!(cur.isAir() || b.isLiquid() || soft)) return false;
 
         Material m = Material.matchMaterial(getConfig().getString("army.place-block", "COBBLESTONE"));
         if (m == null || !m.isBlock() || m.isAir()) m = Material.COBBLESTONE;
@@ -1905,4 +2001,4 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
     public void onDeath(PlayerDeathEvent e) {
         dismiss(e.getPlayer().getUniqueId(), false);
     }
-        }
+            }
