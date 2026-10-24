@@ -17,6 +17,8 @@ import org.bukkit.Material;
 import org.bukkit.NamespacedKey;
 import org.bukkit.Registry;
 import org.bukkit.Sound;
+import org.bukkit.attribute.Attribute;
+import org.bukkit.attribute.AttributeInstance;
 import org.bukkit.block.Block;
 import org.bukkit.block.BlockFace;
 import org.bukkit.block.Container;
@@ -24,7 +26,9 @@ import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
 import org.bukkit.enchantments.Enchantment;
+import org.bukkit.entity.AbstractArrow;
 import org.bukkit.entity.ArmorStand;
+import org.bukkit.entity.Arrow;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.EntityType;
 import org.bukkit.entity.LivingEntity;
@@ -37,6 +41,7 @@ import org.bukkit.event.block.Action;
 import org.bukkit.event.block.BlockBreakEvent;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.entity.PlayerDeathEvent;
+import org.bukkit.event.player.PlayerInteractEntityEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.event.player.PlayerTeleportEvent;
@@ -48,6 +53,7 @@ import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.potion.PotionEffect;
 import org.bukkit.potion.PotionEffectType;
 import org.bukkit.scheduler.BukkitTask;
+import org.bukkit.util.Vector;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -62,17 +68,28 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
 
     private static final long TARGET_WINDOW_MS = 30_000; // a hit/attack counts as "target" for this long before summoning
     private static final long HORN_DEBOUNCE_MS = 700;
-    private static final double ENGAGE_DIST = 9;     // closer than this to the target: charge and attack
-    private static final double DISENGAGE_DIST = 13; // farther than this: go back to formation walking
+    private static final long MARK_LOCK_MS = 10_000;     // a manual mark beats automatic targeting for this long
+    private static final double ARCHER_RANGE = 16;
+    private static final long ARCHER_COOLDOWN_MS = 1_500;
+    private static final double ARROW_DAMAGE = 4.0;
+
+    private enum Formation { RING, CHARGE, SCATTER }
+
+    private enum Role { CAPTAIN, SWORD, AXE, ARCHER }
 
     private static class Army {
         final List<NPC> npcs = new ArrayList<>();
+        final Map<NPC, Role> roles = new HashMap<>();
         final Map<NPC, Location> lastPos = new HashMap<>();
         final Map<NPC, Location> lastDest = new HashMap<>();
         final Map<NPC, Integer> stuck = new HashMap<>();
+        final Map<NPC, Long> lastShot = new HashMap<>();
         final Set<NPC> engaged = new HashSet<>();
         final List<Block> placed = new ArrayList<>();
         Material placedType = Material.COBBLESTONE;
+        Formation formation = Formation.RING;
+        boolean captain = true;
+        int size = 15;
         UUID targetId;      // null = following owner
         BukkitTask task;
         BukkitTask spawnTask;
@@ -83,8 +100,12 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
     private NPCRegistry registry; // anonymous: NPCs are never saved to Citizens' data
 
     private final Map<UUID, Army> armies = new HashMap<>();
+    private final Map<UUID, UUID> npcOwner = new HashMap<>();      // NULL entity -> who commands it
+    private final Map<UUID, Formation> formations = new HashMap<>();
     private final Map<UUID, UUID> lastTarget = new HashMap<>();
     private final Map<UUID, Long> lastTargetTime = new HashMap<>();
+    private final Map<UUID, Long> markLock = new HashMap<>();
+    private final Map<UUID, Long> lastMark = new HashMap<>();
     private final Map<UUID, Long> lastHorn = new HashMap<>();
 
     @Override
@@ -95,6 +116,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         getServer().getPluginManager().registerEvents(this, this);
         getCommand("totemnull").setExecutor(this);
         getCommand("nullcall").setExecutor(this);
+        getCommand("nullform").setExecutor(this);
     }
 
     @Override
@@ -110,6 +132,36 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         if (cmd.getName().equalsIgnoreCase("nullcall")) {
             if (sender instanceof Player caller) {
                 toggle(caller, true);
+            } else {
+                sender.sendMessage("Players only.");
+            }
+            return true;
+        }
+
+        // /nullform <ring|charge|scatter>
+        if (cmd.getName().equalsIgnoreCase("nullform")) {
+            if (sender instanceof Player fp) {
+                Formation current = formations.getOrDefault(fp.getUniqueId(), configFormation());
+                if (args.length == 0) {
+                    fp.sendMessage(Component.text("Formation: " + current.name().toLowerCase()
+                            + " (use ring, charge or scatter)", NamedTextColor.GRAY));
+                    return true;
+                }
+                Formation f;
+                try {
+                    f = Formation.valueOf(args[0].toUpperCase());
+                } catch (IllegalArgumentException ex) {
+                    fp.sendMessage(Component.text("Use: ring, charge or scatter", NamedTextColor.RED));
+                    return true;
+                }
+                formations.put(fp.getUniqueId(), f);
+                Army army = armies.get(fp.getUniqueId());
+                if (army != null) {
+                    army.formation = f;
+                    army.engaged.clear();
+                    army.lastDest.clear();
+                }
+                fp.sendMessage(Component.text("NULL formation: " + f.name().toLowerCase(), NamedTextColor.DARK_GRAY));
             } else {
                 sender.sendMessage("Players only.");
             }
@@ -134,6 +186,14 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
                 .forEach(left -> target.getWorld().dropItemNaturally(target.getLocation(), left));
         target.sendMessage(Component.text("You now command NULL.", NamedTextColor.DARK_GRAY));
         return true;
+    }
+
+    private Formation configFormation() {
+        try {
+            return Formation.valueOf(getConfig().getString("army.formation", "RING").toUpperCase());
+        } catch (IllegalArgumentException ex) {
+            return Formation.RING;
+        }
     }
 
     private ItemStack createTotem() {
@@ -182,7 +242,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         return false;
     }
 
-    // ---------- targets: whatever the holder hits, or whatever hits the holder ----------
+    // ---------- targets: whatever the holder hits, whatever hits the holder, or what they right-click ----------
     private boolean isNpc(Entity e) {
         return e.hasMetadata("NPC");
     }
@@ -205,20 +265,59 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         Entity victim = e.getEntity();
         Entity attacker = shooterOf(e.getDamager());
 
+        // friendly fire: NULL never hurt their own commander or each other
+        UUID armyOwner = npcOwner.get(attacker.getUniqueId());
+        if (armyOwner != null) {
+            if (victim.getUniqueId().equals(armyOwner) || armyOwner.equals(npcOwner.get(victim.getUniqueId()))) {
+                e.setCancelled(true);
+                return;
+            }
+        }
+
         // holder attacks something
         if (attacker instanceof Player holder && !isNpc(holder) && hasTotem(holder) && canTarget(holder, victim)) {
-            noteTarget(holder, victim);
+            noteTarget(holder, victim, false);
         }
         // something attacks the holder
         if (victim instanceof Player defender && !isNpc(defender) && hasTotem(defender) && canTarget(defender, attacker)) {
-            noteTarget(defender, attacker);
+            noteTarget(defender, attacker, false);
         }
     }
 
-    private void noteTarget(Player owner, Entity target) {
+    // right-click something while holding the totem = mark it as the target
+    @EventHandler
+    public void onMark(PlayerInteractEntityEvent e) {
+        Player owner = e.getPlayer();
+        if (isNpc(owner)) return;
+        ItemStack inHand = owner.getInventory().getItem(e.getHand());
+        if (!isTotem(inHand)) return;
+
+        Entity clicked = e.getRightClicked();
+        if (!canTarget(owner, clicked)) return;
+
+        e.setCancelled(true); // don't open trades etc.
+        long now = System.currentTimeMillis();
+        if (now - lastMark.getOrDefault(owner.getUniqueId(), 0L) < 300) return;
+        lastMark.put(owner.getUniqueId(), now);
+
+        noteTarget(owner, clicked, true);
+        owner.sendActionBar(Component.text("NULL target: " + clicked.getName(), NamedTextColor.DARK_RED));
+        owner.playSound(owner.getLocation(), Sound.ENTITY_EXPERIENCE_ORB_PICKUP, 0.7f, 0.6f);
+    }
+
+    private void noteTarget(Player owner, Entity target, boolean manual) {
         UUID oid = owner.getUniqueId();
+        long now = System.currentTimeMillis();
+
+        if (!manual && now < markLock.getOrDefault(oid, 0L)) {
+            Army a = armies.get(oid);
+            LivingEntity current = a != null ? liveTarget(owner, a.targetId) : recentTarget(owner);
+            if (current != null) return;          // a manual mark is still active
+        }
+        if (manual) markLock.put(oid, now + MARK_LOCK_MS);
+
         lastTarget.put(oid, target.getUniqueId());
-        lastTargetTime.put(oid, System.currentTimeMillis());
+        lastTargetTime.put(oid, now);
         Army army = armies.get(oid);
         if (army != null && !target.getUniqueId().equals(army.targetId)) {
             command(owner, army, (LivingEntity) target);
@@ -292,11 +391,23 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         return item;
     }
 
-    private ItemStack nullSword() {
-        return enchanted(Material.NETHERITE_SWORD,
-                Enchantment.SHARPNESS, 5, Enchantment.UNBREAKING, 3, Enchantment.MENDING, 1,
-                Enchantment.FIRE_ASPECT, 2, Enchantment.LOOTING, 3, Enchantment.KNOCKBACK, 2,
-                Enchantment.SWEEPING_EDGE, 3);
+    private ItemStack weaponFor(Role role) {
+        return switch (role) {
+            case CAPTAIN -> enchanted(Material.NETHERITE_SWORD,
+                    Enchantment.SHARPNESS, 6, Enchantment.UNBREAKING, 3, Enchantment.MENDING, 1,
+                    Enchantment.FIRE_ASPECT, 2, Enchantment.LOOTING, 3, Enchantment.KNOCKBACK, 2,
+                    Enchantment.SWEEPING_EDGE, 3);
+            case AXE -> enchanted(Material.NETHERITE_AXE,
+                    Enchantment.SHARPNESS, 5, Enchantment.EFFICIENCY, 5, Enchantment.UNBREAKING, 3,
+                    Enchantment.MENDING, 1, Enchantment.FIRE_ASPECT, 2);
+            case ARCHER -> enchanted(Material.BOW,
+                    Enchantment.POWER, 5, Enchantment.PUNCH, 2, Enchantment.FLAME, 1,
+                    Enchantment.INFINITY, 1, Enchantment.UNBREAKING, 3);
+            default -> enchanted(Material.NETHERITE_SWORD,
+                    Enchantment.SHARPNESS, 5, Enchantment.UNBREAKING, 3, Enchantment.MENDING, 1,
+                    Enchantment.FIRE_ASPECT, 2, Enchantment.LOOTING, 3, Enchantment.KNOCKBACK, 2,
+                    Enchantment.SWEEPING_EDGE, 3);
+        };
     }
 
     private void equipArmor(Equipment eq) {
@@ -337,19 +448,62 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
 
     // ---------- army ----------
 
-    // spread-out spot number <index> around a centre (sunflower pattern, ~2 blocks apart)
-    private Location slot(Location center, int index) {
-        double angle = index * 2.399963;
-        double radius = 2.5 + 0.9 * Math.sqrt(index);
-        Location l = center.clone().add(Math.cos(angle) * radius, 0, Math.sin(angle) * radius);
+    // distance at which a melee NULL stops walking in formation and charges the target
+    private double engageDist(Army army) {
+        return switch (army.formation) {
+            case CHARGE -> 400;
+            case SCATTER -> 12;
+            default -> 9;
+        };
+    }
+
+    // where NULL number <index> stands around a centre (the owner, or the target)
+    private Location slot(Army army, Location center, int index, boolean atTarget) {
+        double x;
+        double z;
+        if (army.captain && index == 0) {
+            x = 1.5;
+            z = 1.5;                                  // the captain stays close to the centre
+        } else {
+            int i = army.captain ? index - 1 : index;
+            int n = Math.max(1, army.captain ? army.size - 1 : army.size);
+            double angle;
+            double radius;
+            if (army.formation == Formation.CHARGE) {
+                angle = i * 2.399963;
+                radius = 1.5 + 0.6 * Math.sqrt(i);    // tight pack
+            } else if (army.formation == Formation.SCATTER) {
+                angle = i * 2.399963;
+                radius = 6 + 1.2 * Math.sqrt(i);      // wide and spread out
+            } else {
+                angle = 2 * Math.PI * i / n;
+                radius = atTarget ? 6 : 4.5;          // even ring
+            }
+            x = Math.cos(angle) * radius;
+            z = Math.sin(angle) * radius;
+        }
+        Location l = center.clone().add(x, 0, z);
         if (!l.getBlock().isPassable()) return center.clone(); // spot is inside a wall: use the centre
         return l;
+    }
+
+    private Role roleFor(Army army, int index) {
+        if (army.captain && index == 0) return Role.CAPTAIN;
+        if (!getConfig().getBoolean("army.mixed-weapons", true)) return Role.SWORD;
+        return switch (index % 3) {
+            case 1 -> Role.ARCHER;
+            case 2 -> Role.AXE;
+            default -> Role.SWORD;
+        };
     }
 
     private void summon(Player owner) {
         Army army = new Army();
         final int size = Math.max(1, Math.min(60, getConfig().getInt("army.size", 15)));
         final long interval = Math.max(1L, getConfig().getLong("army.spawn-interval-ticks", 6L));
+        army.size = size;
+        army.captain = getConfig().getBoolean("army.captain", true);
+        army.formation = formations.getOrDefault(owner.getUniqueId(), configFormation());
 
         LivingEntity first = recentTarget(owner);
         army.targetId = first == null ? null : first.getUniqueId();
@@ -370,25 +524,45 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
 
     private void spawnOne(Player owner, Army army) {
         int index = army.npcs.size();
-        NPC npc = registry.createNPC(EntityType.PLAYER, gibberishName());
+        Role role = roleFor(army, index);
+
+        String name = gibberishName();
+        if (role == Role.CAPTAIN) name = "\u00a7c" + name;   // red name for the captain
+
+        NPC npc = registry.createNPC(EntityType.PLAYER, name);
         npc.setProtected(false); // can be killed
 
         Equipment eq = npc.getOrAddTrait(Equipment.class);
-        eq.set(Equipment.EquipmentSlot.HAND, nullSword());
+        eq.set(Equipment.EquipmentSlot.HAND, weaponFor(role));
         if (getConfig().getBoolean("army.armor", true)) equipArmor(eq);
 
         applySkin(npc);
         npc.getNavigator().getDefaultParameters().range(100f).speedModifier(1.2f);
 
-        Location at = slot(owner.getLocation(), index);
+        Location at = slot(army, owner.getLocation(), index, false);
         npc.spawn(at);
 
-        if (getConfig().getBoolean("army.effects", true) && npc.getEntity() instanceof LivingEntity le) {
-            le.addPotionEffect(new PotionEffect(PotionEffectType.STRENGTH, PotionEffect.INFINITE_DURATION, 1, false, false));
-            le.addPotionEffect(new PotionEffect(PotionEffectType.RESISTANCE, PotionEffect.INFINITE_DURATION, 0, false, false));
+        if (npc.getEntity() instanceof LivingEntity le) {
+            boolean cap = role == Role.CAPTAIN;
+            if (getConfig().getBoolean("army.effects", true)) {
+                le.addPotionEffect(new PotionEffect(PotionEffectType.STRENGTH, PotionEffect.INFINITE_DURATION, cap ? 2 : 1, false, false));
+                le.addPotionEffect(new PotionEffect(PotionEffectType.RESISTANCE, PotionEffect.INFINITE_DURATION, cap ? 1 : 0, false, false));
+                if (cap) {
+                    le.addPotionEffect(new PotionEffect(PotionEffectType.SPEED, PotionEffect.INFINITE_DURATION, 0, false, false));
+                }
+            }
+            if (cap) {
+                AttributeInstance maxHealth = le.getAttribute(Attribute.MAX_HEALTH);
+                if (maxHealth != null) {
+                    maxHealth.setBaseValue(60);
+                    le.setHealth(60);
+                }
+            }
+            npcOwner.put(le.getUniqueId(), owner.getUniqueId());
         }
 
         army.npcs.add(npc);
+        army.roles.put(npc, role);
         at.getWorld().playSound(at, Sound.ENTITY_ENDERMAN_TELEPORT, 0.5f, 1.2f);
     }
 
@@ -432,19 +606,26 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         Navigator nav = npc.getNavigator();
         Location here = npc.getEntity().getLocation();
         int index = Math.max(0, army.npcs.indexOf(npc));
+        Role role = army.roles.getOrDefault(npc, Role.SWORD);
 
         if (target != null) {
             Location tl = target.getLocation();
             if (!here.getWorld().equals(tl.getWorld())) return;   // pursue() teleports it over
             double d = here.distance(tl);
-            boolean engaged = army.engaged.contains(npc);
 
-            if (engaged && d > DISENGAGE_DIST) {
+            if (role == Role.ARCHER) {
+                steerArcher(army, npc, nav, here, tl, d, target, index);
+                return;
+            }
+
+            double engage = engageDist(army);
+            boolean engaged = army.engaged.contains(npc);
+            if (engaged && d > engage + 4) {
                 army.engaged.remove(npc);
                 army.lastDest.remove(npc);
                 engaged = false;
             }
-            if (!engaged && d <= ENGAGE_DIST) {
+            if (!engaged && d <= engage) {
                 army.engaged.add(npc);
                 nav.setTarget(target, true);              // close enough: charge and attack
                 return;
@@ -453,18 +634,56 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
                 if (!nav.isNavigating()) nav.setTarget(target, true);
                 return;
             }
-            walkTo(army, npc, nav, here, slot(tl, index)); // far away: walk in formation
+            walkTo(army, npc, nav, here, slot(army, tl, index, true)); // far away: walk in formation
             return;
         }
 
-        // no target: follow the owner, each NPC in its own spot
+        // no target: follow the owner
         Location o = owner.getLocation();
         if (!here.getWorld().equals(o.getWorld()) || here.distanceSquared(o) > 40 * 40) {
-            npc.teleport(slot(o, index), PlayerTeleportEvent.TeleportCause.PLUGIN);
+            npc.teleport(slot(army, o, index, false), PlayerTeleportEvent.TeleportCause.PLUGIN);
             army.lastDest.remove(npc);
             return;
         }
-        walkTo(army, npc, nav, here, slot(o, index));
+        walkTo(army, npc, nav, here, slot(army, o, index, false));
+    }
+
+    // archers stop at range and shoot instead of running into melee
+    private void steerArcher(Army army, NPC npc, Navigator nav, Location here, Location tl, double d,
+                             LivingEntity target, int index) {
+        if (npc.getEntity() instanceof LivingEntity me && d <= ARCHER_RANGE && me.hasLineOfSight(target)) {
+            if (nav.isNavigating()) nav.cancelNavigation();
+            army.lastDest.remove(npc);
+            npc.faceLocation(target.getEyeLocation());
+            shoot(army, npc, me, target);
+            return;
+        }
+        if (d <= ARCHER_RANGE + 10) {
+            walkTo(army, npc, nav, here, tl);                              // get a clear shot
+        } else {
+            walkTo(army, npc, nav, here, slot(army, tl, index, true));     // far away: walk in formation
+        }
+    }
+
+    private void shoot(Army army, NPC npc, LivingEntity me, LivingEntity target) {
+        long now = System.currentTimeMillis();
+        if (now - army.lastShot.getOrDefault(npc, 0L) < ARCHER_COOLDOWN_MS) return;
+        army.lastShot.put(npc, now);
+
+        Location eye = me.getEyeLocation();
+        Vector dir = target.getEyeLocation().toVector().subtract(eye.toVector());
+        double dist = dir.length();
+        if (dist < 0.5) return;
+        dir.normalize();
+        dir.setY(dir.getY() + dist * 0.012);          // small arc compensation
+
+        Arrow arrow = me.getWorld().spawnArrow(eye, dir, 3.0f, 1.0f, Arrow.class);
+        arrow.setShooter(me);
+        arrow.setCritical(true);
+        arrow.setDamage(ARROW_DAMAGE);
+        arrow.setFireTicks(100);                      // flame
+        arrow.setPickupStatus(AbstractArrow.PickupStatus.DISALLOWED);
+        me.getWorld().playSound(eye, Sound.ENTITY_ARROW_SHOOT, 1f, 1f);
     }
 
     private void walkTo(Army army, NPC npc, Navigator nav, Location here, Location dest) {
@@ -481,13 +700,20 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
     private void pursue(Player owner, Army army, NPC npc, Location here, LivingEntity target) {
         Location to = target.getLocation();
         if (!here.getWorld().equals(to.getWorld())) {
-            npc.teleport(slot(owner.getLocation(), Math.max(0, army.npcs.indexOf(npc))),
+            npc.teleport(slot(army, owner.getLocation(), Math.max(0, army.npcs.indexOf(npc)), false),
                     PlayerTeleportEvent.TeleportCause.PLUGIN);
             army.lastDest.remove(npc);
             return;
         }
 
         Location last = army.lastPos.put(npc, here.clone());
+
+        // an archer standing still and shooting is not stuck
+        if (army.roles.get(npc) == Role.ARCHER && npc.getEntity() instanceof LivingEntity me
+                && here.distanceSquared(to) <= ARCHER_RANGE * ARCHER_RANGE && me.hasLineOfSight(target)) {
+            army.stuck.put(npc, 0);
+            return;
+        }
         if (here.distanceSquared(to) <= 9) {          // close enough: it is fighting
             army.stuck.put(npc, 0);
             return;
@@ -605,6 +831,8 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
             if (where == null && npc.isSpawned()) where = npc.getEntity().getLocation();
             npc.destroy();
         }
+        npcOwner.values().removeIf(v -> v.equals(ownerId));
+
         // remove blocks the army placed
         for (Block b : army.placed) {
             if (b.getType() == army.placedType) b.setType(Material.AIR);
@@ -623,4 +851,4 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
     public void onDeath(PlayerDeathEvent e) {
         dismiss(e.getPlayer().getUniqueId(), false);
     }
-                                  }
+                                                  }
