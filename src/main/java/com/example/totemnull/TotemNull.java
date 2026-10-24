@@ -11,17 +11,23 @@ import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
 import net.kyori.adventure.text.format.TextDecoration;
 import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
+import org.bukkit.Axis;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.NamespacedKey;
+import org.bukkit.Particle;
 import org.bukkit.Registry;
 import org.bukkit.Sound;
+import org.bukkit.World;
 import org.bukkit.attribute.Attribute;
 import org.bukkit.attribute.AttributeInstance;
 import org.bukkit.block.Block;
 import org.bukkit.block.BlockFace;
+import org.bukkit.block.BlockState;
 import org.bukkit.block.Container;
+import org.bukkit.block.data.BlockData;
+import org.bukkit.block.data.Orientable;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
@@ -39,12 +45,17 @@ import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.Action;
 import org.bukkit.event.block.BlockBreakEvent;
+import org.bukkit.event.block.BlockPlaceEvent;
+import org.bukkit.event.entity.CreatureSpawnEvent;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
+import org.bukkit.event.entity.EntityPortalEvent;
 import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.player.PlayerInteractEntityEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
+import org.bukkit.event.player.PlayerPortalEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.event.player.PlayerTeleportEvent;
+import org.bukkit.inventory.EquipmentSlot;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.inventory.meta.MusicInstrumentMeta;
@@ -72,10 +83,21 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
     private static final double ARCHER_RANGE = 16;
     private static final long ARCHER_COOLDOWN_MS = 1_500;
     private static final double ARROW_DAMAGE = 4.0;
+    private static final long PORTAL_OPEN_TICKS = 15;    // portal opens this long before the NULL steps out
+    private static final long PORTAL_STAY_TICKS = 45;    // ...and stays open this long after
+    private static final double PORTAL_MIN_DIST = 6;
+    private static final double PORTAL_MAX_DIST = 14;
 
     private enum Formation { RING, CHARGE, SCATTER }
 
     private enum Role { CAPTAIN, SWORD, AXE, ARCHER }
+
+    // a temporary nether portal used as an entrance
+    private static class Portal {
+        final List<BlockState> originals = new ArrayList<>();
+        Location center;
+        boolean closed = false;
+    }
 
     private static class Army {
         final List<NPC> npcs = new ArrayList<>();
@@ -86,10 +108,13 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         final Map<NPC, Long> lastShot = new HashMap<>();
         final Set<NPC> engaged = new HashSet<>();
         final List<Block> placed = new ArrayList<>();
+        final List<Portal> portals = new ArrayList<>();
         Material placedType = Material.COBBLESTONE;
         Formation formation = Formation.RING;
         boolean captain = true;
+        boolean dismissed = false;
         int size = 15;
+        int pending = 0;    // NULL whose portal is open but who has not stepped out yet
         UUID targetId;      // null = following owner
         BukkitTask task;
         BukkitTask spawnTask;
@@ -100,6 +125,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
     private NPCRegistry registry; // anonymous: NPCs are never saved to Citizens' data
 
     private final Map<UUID, Army> armies = new HashMap<>();
+    private final Set<Portal> activePortals = new HashSet<>();
     private final Map<UUID, UUID> npcOwner = new HashMap<>();      // NULL entity -> who commands it
     private final Map<UUID, Formation> formations = new HashMap<>();
     private final Map<UUID, UUID> lastTarget = new HashMap<>();
@@ -122,6 +148,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
     @Override
     public void onDisable() {
         for (UUID id : new ArrayList<>(armies.keySet())) dismiss(id, false);
+        for (Portal p : new ArrayList<>(activePortals)) closePortal(p);
         if (registry != null) registry.deregisterAll();
     }
 
@@ -446,6 +473,122 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         }
     }
 
+    // ---------- portals ----------
+
+    // true if the location is next to one of our temporary portals
+    private boolean nearOurPortal(Location l) {
+        if (l == null || l.getWorld() == null) return false;
+        for (Portal p : activePortals) {
+            if (p.center.getWorld().equals(l.getWorld()) && p.center.distanceSquared(l) <= 16) return true;
+        }
+        return false;
+    }
+
+    // nobody can be teleported through our portals, and they spawn no piglins
+    @EventHandler
+    public void onPlayerPortal(PlayerPortalEvent e) {
+        if (nearOurPortal(e.getFrom())) e.setCancelled(true);
+    }
+
+    @EventHandler
+    public void onEntityPortal(EntityPortalEvent e) {
+        if (nearOurPortal(e.getFrom())) e.setCancelled(true);
+    }
+
+    @EventHandler
+    public void onPortalSpawn(CreatureSpawnEvent e) {
+        if (e.getSpawnReason() == CreatureSpawnEvent.SpawnReason.NETHER_PORTAL && nearOurPortal(e.getLocation())) {
+            e.setCancelled(true);
+        }
+    }
+
+    private int findGround(World w, int x, int startY, int z) {
+        for (int y = startY + 3; y >= startY - 4; y--) {
+            Block below = w.getBlockAt(x, y - 1, z);
+            Block at = w.getBlockAt(x, y, z);
+            if (below.getType().isSolid() && !below.isLiquid() && at.isPassable() && !at.isLiquid()) return y;
+        }
+        return Integer.MIN_VALUE;
+    }
+
+    private boolean allowedToBuild(Player owner, Block b) {
+        BlockPlaceEvent ev = new BlockPlaceEvent(b, b.getState(), b.getRelative(BlockFace.DOWN),
+                new ItemStack(Material.OBSIDIAN), owner, true, EquipmentSlot.HAND);
+        Bukkit.getPluginManager().callEvent(ev);
+        return !ev.isCancelled() && ev.canBuild();
+    }
+
+    // builds a 4x5 portal (obsidian frame, 2x3 portal inside) at a random spot near the owner
+    private Portal openPortal(Player owner) {
+        ThreadLocalRandom r = ThreadLocalRandom.current();
+        Location o = owner.getLocation();
+        World w = o.getWorld();
+
+        for (int attempt = 0; attempt < 12; attempt++) {
+            double angle = r.nextDouble(Math.PI * 2);
+            double dist = r.nextDouble(PORTAL_MIN_DIST, PORTAL_MAX_DIST);
+            int bx = o.getBlockX() + (int) Math.round(Math.cos(angle) * dist);
+            int bz = o.getBlockZ() + (int) Math.round(Math.sin(angle) * dist);
+            boolean axisX = r.nextBoolean();
+            int dx = axisX ? 1 : 0;
+            int dz = axisX ? 0 : 1;
+
+            if (!w.isChunkLoaded(bx >> 4, bz >> 4) || !w.isChunkLoaded((bx + 3 * dx) >> 4, (bz + 3 * dz) >> 4)) continue;
+            int by = findGround(w, bx, o.getBlockY(), bz);
+            if (by == Integer.MIN_VALUE) continue;
+            if (by < w.getMinHeight() + 1 || by + 5 >= w.getMaxHeight()) continue;
+
+            Portal p = tryBuild(owner, w, bx, by, bz, axisX);
+            if (p != null) return p;
+        }
+        return null;
+    }
+
+    private Portal tryBuild(Player owner, World w, int bx, int by, int bz, boolean axisX) {
+        int dx = axisX ? 1 : 0;
+        int dz = axisX ? 0 : 1;
+
+        // everything the portal would replace must be empty, and the ground under it solid
+        for (int wd = 0; wd < 4; wd++) {
+            Block ground = w.getBlockAt(bx + dx * wd, by - 1, bz + dz * wd);
+            if (!ground.getType().isSolid() || ground.isLiquid()) return null;
+            for (int h = 0; h < 5; h++) {
+                Block b = w.getBlockAt(bx + dx * wd, by + h, bz + dz * wd);
+                if (!(b.getType().isAir() || (b.isPassable() && !b.isLiquid()))) return null;
+            }
+        }
+        if (!allowedToBuild(owner, w.getBlockAt(bx, by, bz))) return null; // protection plugins can say no
+
+        Portal p = new Portal();
+        BlockData portalData = Material.NETHER_PORTAL.createBlockData();
+        if (portalData instanceof Orientable orientable) {
+            orientable.setAxis(axisX ? Axis.X : Axis.Z);
+        }
+        for (int wd = 0; wd < 4; wd++) {
+            for (int h = 0; h < 5; h++) {
+                Block b = w.getBlockAt(bx + dx * wd, by + h, bz + dz * wd);
+                p.originals.add(b.getState());
+                boolean frame = wd == 0 || wd == 3 || h == 0 || h == 4;
+                if (frame) {
+                    b.setType(Material.OBSIDIAN, false);
+                } else {
+                    b.setBlockData(portalData, false);
+                }
+            }
+        }
+        // the NULL steps out at the bottom middle of the portal
+        p.center = new Location(w, bx + (axisX ? 2.0 : 0.5), by + 1, bz + (axisX ? 0.5 : 2.0));
+        return p;
+    }
+
+    private void closePortal(Portal p) {
+        if (p.closed) return;
+        p.closed = true;
+        activePortals.remove(p);
+        for (BlockState s : p.originals) s.update(true, false); // put the old blocks back
+        p.center.getWorld().playSound(p.center, Sound.BLOCK_FIRE_EXTINGUISH, 0.6f, 0.8f);
+    }
+
     // ---------- army ----------
 
     // distance at which a melee NULL stops walking in formation and charges the target
@@ -510,19 +653,44 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         armies.put(owner.getUniqueId(), army);
         owner.getWorld().playSound(owner.getLocation(), Sound.ENTITY_WITHER_SPAWN, 0.6f, 1.4f);
 
-        // they appear one by one
+        // one entrance after another
         army.spawnTask = Bukkit.getScheduler().runTaskTimer(this, () -> {
-            if (!owner.isOnline() || owner.isDead() || army.npcs.size() >= size) {
+            if (!owner.isOnline() || owner.isDead() || army.npcs.size() + army.pending >= size) {
                 army.spawnTask.cancel();
                 return;
             }
-            spawnOne(owner, army);
+            scheduleEntrance(owner, army);
         }, 0L, interval);
 
         army.task = Bukkit.getScheduler().runTaskTimer(this, () -> tickArmy(owner, army), 10L, 10L);
     }
 
-    private void spawnOne(Player owner, Army army) {
+    // opens a portal, then a moment later the NULL steps out of it
+    private void scheduleEntrance(Player owner, Army army) {
+        army.pending++;
+
+        final Portal portal = getConfig().getBoolean("army.portals", true) ? openPortal(owner) : null;
+        if (portal != null) {
+            army.portals.add(portal);
+            activePortals.add(portal);
+            World w = portal.center.getWorld();
+            w.playSound(portal.center, Sound.BLOCK_PORTAL_TRIGGER, 0.5f, 1.4f);
+            w.spawnParticle(Particle.PORTAL, portal.center.clone().add(0, 1, 0), 60, 0.6, 1.0, 0.6, 0.4);
+        }
+
+        long delay = portal != null ? PORTAL_OPEN_TICKS : 1L;
+        Bukkit.getScheduler().runTaskLater(this, () -> {
+            army.pending--;
+            if (army.dismissed || !owner.isOnline() || owner.isDead()) return;
+            spawnOne(owner, army, portal == null ? null : portal.center);
+        }, delay);
+
+        if (portal != null) {
+            Bukkit.getScheduler().runTaskLater(this, () -> closePortal(portal), delay + PORTAL_STAY_TICKS);
+        }
+    }
+
+    private void spawnOne(Player owner, Army army, Location at) {
         int index = army.npcs.size();
         Role role = roleFor(army, index);
 
@@ -539,8 +707,8 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         applySkin(npc);
         npc.getNavigator().getDefaultParameters().range(100f).speedModifier(1.2f);
 
-        Location at = slot(army, owner.getLocation(), index, false);
-        npc.spawn(at);
+        Location spawnAt = at != null ? at.clone() : slot(army, owner.getLocation(), index, false);
+        npc.spawn(spawnAt);
 
         if (npc.getEntity() instanceof LivingEntity le) {
             boolean cap = role == Role.CAPTAIN;
@@ -563,7 +731,13 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
 
         army.npcs.add(npc);
         army.roles.put(npc, role);
-        at.getWorld().playSound(at, Sound.ENTITY_ENDERMAN_TELEPORT, 0.5f, 1.2f);
+        spawnAt.getWorld().playSound(spawnAt, Sound.ENTITY_ENDERMAN_TELEPORT, 0.5f, 1.2f);
+        if (at != null) {
+            spawnAt.getWorld().spawnParticle(Particle.PORTAL, spawnAt.clone().add(0, 1, 0), 40, 0.3, 0.8, 0.3, 0.3);
+        }
+
+        // start walking right away
+        steerOne(owner, army, npc, liveTarget(owner, army.targetId));
     }
 
     // new target (or null = follow the owner)
@@ -603,6 +777,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
 
     // decides where one NPC should be heading
     private void steerOne(Player owner, Army army, NPC npc, LivingEntity target) {
+        if (!npc.isSpawned()) return;
         Navigator nav = npc.getNavigator();
         Location here = npc.getEntity().getLocation();
         int index = Math.max(0, army.npcs.indexOf(npc));
@@ -823,6 +998,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
     private void dismiss(UUID ownerId, boolean sound) {
         Army army = armies.remove(ownerId);
         if (army == null) return;
+        army.dismissed = true;
         if (army.task != null) army.task.cancel();
         if (army.spawnTask != null) army.spawnTask.cancel();
 
@@ -832,6 +1008,9 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
             npc.destroy();
         }
         npcOwner.values().removeIf(v -> v.equals(ownerId));
+
+        // close any portals that are still open (puts the old blocks back)
+        for (Portal p : army.portals) closePortal(p);
 
         // remove blocks the army placed
         for (Block b : army.placed) {
@@ -851,4 +1030,4 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
     public void onDeath(PlayerDeathEvent e) {
         dismiss(e.getPlayer().getUniqueId(), false);
     }
-                                                  }
+    }
