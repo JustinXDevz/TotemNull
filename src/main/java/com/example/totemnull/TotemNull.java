@@ -14,6 +14,7 @@ import net.kyori.adventure.text.format.TextDecoration;
 import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
 import org.bukkit.Axis;
 import org.bukkit.Bukkit;
+import org.bukkit.GameMode;
 import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.NamespacedKey;
@@ -41,14 +42,17 @@ import org.bukkit.entity.EntityType;
 import org.bukkit.entity.LivingEntity;
 import org.bukkit.entity.Player;
 import org.bukkit.entity.Projectile;
+import org.bukkit.entity.TNTPrimed;
 import org.bukkit.entity.Tameable;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.Action;
 import org.bukkit.event.block.BlockBreakEvent;
+import org.bukkit.event.block.BlockIgniteEvent;
 import org.bukkit.event.block.BlockPlaceEvent;
 import org.bukkit.event.entity.CreatureSpawnEvent;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
+import org.bukkit.event.entity.EntityDamageEvent;
 import org.bukkit.event.entity.EntityDeathEvent;
 import org.bukkit.event.entity.EntityPortalEvent;
 import org.bukkit.event.entity.PlayerDeathEvent;
@@ -69,8 +73,10 @@ import org.bukkit.scheduler.BukkitTask;
 import org.bukkit.util.Vector;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -93,10 +99,14 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
     private static final double MACE_LAUNCH_MIN = 14;    // elytra-mace NULL take off when the target is this far...
     private static final double MACE_LAUNCH_MAX = 60;    // ...and not farther than this
     private static final int MACE_FLIGHT_MAX_TICKS = 80;
+    private static final int JOB_MAX_TICKS = 20 * 40;    // an order is dropped after 40 seconds
+    private static final int BRIDGE_BLOCKS_PER_STEP = 6; // blocks placed every 2 ticks while bridging
 
     private enum Formation { RING, CHARGE, SCATTER }
 
     private enum Role { CAPTAIN, SWORD, AXE, ARCHER, MACE }
+
+    private enum JobType { BURN, BLAST, BRIDGE }
 
     // a temporary nether portal used as an entrance
     private static class Portal {
@@ -113,6 +123,38 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         double apexY;
     }
 
+    // an order given with flint and steel / TNT / a wither skull
+    private static class Job {
+        final JobType type;
+        final Location where;
+        final List<NPC> workers = new ArrayList<>();
+        int ticks = 0;
+        boolean working = false;   // false = still walking over
+        int placed = 0;            // fires lit / TNT placed
+        int misses = 0;
+        int tntLeft = 0;
+        List<Block> path;          // bridge blocks, in building order
+        int next = 0;
+
+        Job(JobType type, Location where) {
+            this.type = type;
+            this.where = where;
+        }
+    }
+
+    // area where fire does not hurt the commander or their NULL
+    private static class BurnZone {
+        final UUID owner;
+        final Location center;
+        final long until;
+
+        BurnZone(UUID owner, Location center, long until) {
+            this.owner = owner;
+            this.center = center;
+            this.until = until;
+        }
+    }
+
     private static class Army {
         final List<NPC> npcs = new ArrayList<>();
         final Map<NPC, Role> roles = new HashMap<>();
@@ -126,6 +168,8 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         final Map<NPC, Flight> flights = new HashMap<>();   // elytra-mace NULL that are in the air
         final Map<NPC, Long> maceReady = new HashMap<>();   // when a mace NULL may take off again
         final Set<NPC> engaged = new HashSet<>();
+        final Set<NPC> busy = new HashSet<>();              // NULL carrying out an order
+        final List<Job> jobs = new ArrayList<>();
         final List<Block> placed = new ArrayList<>();
         final List<Portal> portals = new ArrayList<>();
         Material placedType = Material.COBBLESTONE;
@@ -142,6 +186,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         BukkitTask spawnTask;
         BukkitTask lookTask;
         BukkitTask flightTask;
+        BukkitTask jobTask;
         int ticks = 0;
     }
 
@@ -150,6 +195,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
 
     private final Map<UUID, Army> armies = new HashMap<>();
     private final Set<Portal> activePortals = new HashSet<>();
+    private final List<BurnZone> burnZones = new ArrayList<>();
     private final Map<UUID, UUID> npcOwner = new HashMap<>();      // NULL entity -> who commands it
     private final Map<UUID, Formation> formations = new HashMap<>();
     private final Map<UUID, UUID> lastTarget = new HashMap<>();
@@ -157,6 +203,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
     private final Map<UUID, Long> markLock = new HashMap<>();
     private final Map<UUID, Long> lastMark = new HashMap<>();
     private final Map<UUID, Long> lastRally = new HashMap<>();
+    private final Map<UUID, Long> lastOrder = new HashMap<>();
     private final Map<UUID, Long> lastHorn = new HashMap<>();
 
     @Override
@@ -299,8 +346,10 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         return e.hasMetadata("NPC");
     }
 
+    // who really did the damage: the shooter of an arrow, the NULL who lit a TNT
     private Entity shooterOf(Entity damager) {
         if (damager instanceof Projectile proj && proj.getShooter() instanceof Entity shooter) return shooter;
+        if (damager instanceof TNTPrimed tnt && tnt.getSource() != null) return tnt.getSource();
         return damager;
     }
 
@@ -317,10 +366,14 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         Entity victim = e.getEntity();
         Entity attacker = shooterOf(e.getDamager());
 
-        // friendly fire: NULL never hurt their own commander or each other
+        // friendly fire: NULL never hurt their commander, each other, or the commander's pets
         UUID armyOwner = npcOwner.get(attacker.getUniqueId());
         if (armyOwner != null) {
-            if (victim.getUniqueId().equals(armyOwner) || armyOwner.equals(npcOwner.get(victim.getUniqueId()))) {
+            boolean ally = victim.getUniqueId().equals(armyOwner)
+                    || armyOwner.equals(npcOwner.get(victim.getUniqueId()))
+                    || (victim instanceof Tameable pet && pet.getOwner() != null
+                        && pet.getOwner().getUniqueId().equals(armyOwner));
+            if (ally) {
                 e.setCancelled(true);
                 return;
             }
@@ -334,6 +387,33 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         if (victim instanceof Player defender && !isNpc(defender) && hasTotem(defender) && canTarget(defender, attacker)) {
             noteTarget(defender, attacker, false);
         }
+    }
+
+    // fire from the army's own burn orders never hurts the commander or their NULL
+    @EventHandler(ignoreCancelled = true)
+    public void onFireDamage(EntityDamageEvent e) {
+        EntityDamageEvent.DamageCause cause = e.getCause();
+        if (cause != EntityDamageEvent.DamageCause.FIRE && cause != EntityDamageEvent.DamageCause.FIRE_TICK) return;
+
+        Entity entity = e.getEntity();
+        UUID ownerId = npcOwner.get(entity.getUniqueId());
+        if (ownerId == null && entity instanceof Player p && !isNpc(p)) ownerId = p.getUniqueId();
+        if (ownerId == null) return;
+
+        if (inBurnZone(ownerId, entity.getLocation())) {
+            e.setCancelled(true);
+            entity.setFireTicks(0);
+        }
+    }
+
+    private boolean inBurnZone(UUID ownerId, Location l) {
+        long now = System.currentTimeMillis();
+        burnZones.removeIf(z -> z.until < now);
+        for (BurnZone z : burnZones) {
+            if (z.owner.equals(ownerId) && z.center.getWorld().equals(l.getWorld())
+                    && z.center.distanceSquared(l) <= 100) return true;
+        }
+        return false;
     }
 
     // right-click something while holding the totem = mark it as the target
@@ -355,6 +435,30 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         noteTarget(owner, clicked, true);
         owner.sendActionBar(Component.text("NULL target: " + clicked.getName(), NamedTextColor.DARK_RED));
         owner.playSound(owner.getLocation(), Sound.ENTITY_EXPERIENCE_ORB_PICKUP, 0.7f, 0.6f);
+    }
+
+    // flint and steel on a mob/player while NULL are out: set it on fire and send the army after it
+    @EventHandler
+    public void onBurnEntity(PlayerInteractEntityEvent e) {
+        Player owner = e.getPlayer();
+        if (e.getHand() != EquipmentSlot.HAND || owner.isSneaking() || isNpc(owner)) return;
+        if (owner.getInventory().getItemInMainHand().getType() != Material.FLINT_AND_STEEL) return;
+
+        Army army = armies.get(owner.getUniqueId());
+        if (army == null || !hasTotem(owner)) return;
+
+        Entity clicked = e.getRightClicked();
+        if (!canTarget(owner, clicked)) return;
+
+        e.setCancelled(true);
+        long now = System.currentTimeMillis();
+        if (now - lastMark.getOrDefault(owner.getUniqueId(), 0L) < 300) return;
+        lastMark.put(owner.getUniqueId(), now);
+
+        clicked.setFireTicks(200);
+        noteTarget(owner, clicked, true);
+        clicked.getWorld().playSound(clicked.getLocation(), Sound.ITEM_FLINTANDSTEEL_USE, 1f, 1f);
+        owner.sendActionBar(Component.text("NULL: burn " + clicked.getName(), NamedTextColor.GOLD));
     }
 
     // sneak + right-click a block with the totem = rally point, sneak + right-click the air = follow me again
@@ -394,6 +498,43 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         for (NPC npc : army.npcs) {
             if (npc.isSpawned() && !army.flights.containsKey(npc)) steerOne(owner, army, npc, t);
         }
+    }
+
+    // flint and steel / TNT / wither skull + right-click = burn / blow up / bridge
+    @EventHandler
+    public void onOrder(PlayerInteractEvent e) {
+        if (e.getHand() != EquipmentSlot.HAND) return;
+        ItemStack item = e.getItem();
+        if (item == null) return;
+
+        JobType type;
+        Material m = item.getType();
+        if (m == Material.FLINT_AND_STEEL) {
+            type = JobType.BURN;
+        } else if (m == Material.TNT) {
+            type = JobType.BLAST;
+        } else if (m == Material.WITHER_SKELETON_SKULL) {
+            type = JobType.BRIDGE;
+        } else {
+            return;
+        }
+
+        Action action = e.getAction();
+        boolean onBlock = action == Action.RIGHT_CLICK_BLOCK && e.getClickedBlock() != null;
+        boolean inAir = action == Action.RIGHT_CLICK_AIR;
+        if (!onBlock && !(inAir && type == JobType.BRIDGE)) return;
+
+        Player owner = e.getPlayer();
+        if (owner.isSneaking() || isNpc(owner)) return;      // sneaking = normal use of the item
+        Army army = armies.get(owner.getUniqueId());
+        if (army == null || !hasTotem(owner)) return;         // only while commanding NULL
+
+        e.setCancelled(true);
+        long now = System.currentTimeMillis();
+        if (now - lastOrder.getOrDefault(owner.getUniqueId(), 0L) < 500) return;
+        lastOrder.put(owner.getUniqueId(), now);
+
+        giveOrder(owner, army, type, onBlock ? e.getClickedBlock() : null);
     }
 
     private void noteTarget(Player owner, Entity target, boolean manual) {
@@ -597,6 +738,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         return Integer.MIN_VALUE;
     }
 
+    // asks protection plugins whether this player may build here
     private boolean allowedToBuild(Player owner, Block b) {
         BlockPlaceEvent ev = new BlockPlaceEvent(b, b.getState(), b.getRelative(BlockFace.DOWN),
                 new ItemStack(Material.OBSIDIAN), owner, true, EquipmentSlot.HAND);
@@ -755,6 +897,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         army.task = Bukkit.getScheduler().runTaskTimer(this, () -> tickArmy(owner, army), TICK, TICK);
         army.lookTask = Bukkit.getScheduler().runTaskTimer(this, () -> lookTick(owner, army), 2L, 2L);
         army.flightTask = Bukkit.getScheduler().runTaskTimer(this, () -> flightTick(owner, army), 1L, 1L);
+        army.jobTask = Bukkit.getScheduler().runTaskTimer(this, () -> jobTick(owner, army), 2L, 2L);
     }
 
     // opens a portal, then a moment later the NULL steps out of it
@@ -833,6 +976,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         if (forcedIndex >= 0 && forcedIndex < army.npcs.size()) {
             NPC old = army.npcs.get(forcedIndex);   // the killed one: swap it out
             army.roles.remove(old);
+            army.busy.remove(old);
             old.destroy();
             army.npcs.set(forcedIndex, npc);
         } else {
@@ -876,6 +1020,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         army.busyUntil.remove(dead);
         army.flights.remove(dead);
         army.maceReady.remove(dead);
+        army.busy.remove(dead);
 
         if (index >= 0) queueReplacement(owner, army, index);
     }
@@ -924,6 +1069,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         for (NPC npc : army.npcs) {
             if (!npc.isSpawned()) continue;
             if (army.flights.containsKey(npc)) continue;   // in the air: flightTick drives it
+            if (army.busy.contains(npc)) continue;         // carrying out an order: jobTick drives it
 
             Location here = npc.getEntity().getLocation();
             if (target != null && army.roles.get(npc) == Role.MACE
@@ -951,7 +1097,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         LivingEntity target = liveTarget(owner, army.targetId);
 
         for (NPC npc : army.npcs) {
-            if (!npc.isSpawned() || army.flights.containsKey(npc)) continue;
+            if (!npc.isSpawned() || army.flights.containsKey(npc) || army.busy.contains(npc)) continue;
 
             Location focus = army.focus.get(npc);
             Long until = army.busyUntil.get(npc);
@@ -967,6 +1113,341 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
                 }
             }
         }
+    }
+
+    // ---------- orders: burn / blow up / bridge ----------
+
+    private double distSq(Location a, Location b) {
+        if (!a.getWorld().equals(b.getWorld())) return Double.MAX_VALUE;
+        return a.distanceSquared(b);
+    }
+
+    // the free NULL closest to a spot
+    private List<NPC> pickWorkers(Army army, Location where, int count) {
+        List<NPC> pool = new ArrayList<>();
+        for (NPC n : army.npcs) {
+            if (n.isSpawned() && !army.busy.contains(n) && !army.flights.containsKey(n)) pool.add(n);
+        }
+        pool.sort(Comparator.comparingDouble(n -> distSq(n.getEntity().getLocation(), where)));
+        return new ArrayList<>(pool.subList(0, Math.min(count, pool.size())));
+    }
+
+    private void giveOrder(Player owner, Army army, JobType type, Block clicked) {
+        if (army.jobs.size() >= 3) {
+            owner.sendActionBar(Component.text("NULL are busy.", NamedTextColor.RED));
+            return;
+        }
+
+        if (type == JobType.BURN) {
+            Location where = clicked.getLocation().add(0.5, 1.0, 0.5);
+            List<NPC> workers = pickWorkers(army, where, Math.max(1, getConfig().getInt("army.burn-workers", 4)));
+            if (workers.isEmpty()) {
+                owner.sendActionBar(Component.text("No free NULL.", NamedTextColor.RED));
+                return;
+            }
+            Job job = new Job(JobType.BURN, where);
+            job.workers.addAll(workers);
+            army.busy.addAll(workers);
+            army.jobs.add(job);
+            burnZones.add(new BurnZone(owner.getUniqueId(), where.clone(), System.currentTimeMillis() + 45_000));
+            owner.sendActionBar(Component.text("NULL: burn it.", NamedTextColor.GOLD));
+            return;
+        }
+
+        if (type == JobType.BLAST) {
+            Block above = clicked.getRelative(BlockFace.UP);
+            if (!allowedToBuild(owner, above)) {
+                owner.sendActionBar(Component.text("You can't blow that up here.", NamedTextColor.RED));
+                return;
+            }
+            Location where = clicked.getLocation().add(0.5, 1.0, 0.5);
+            List<NPC> workers = pickWorkers(army, where, Math.max(1, getConfig().getInt("army.tnt-workers", 3)));
+            if (workers.isEmpty()) {
+                owner.sendActionBar(Component.text("No free NULL.", NamedTextColor.RED));
+                return;
+            }
+            if (getConfig().getBoolean("army.consume-tnt", true) && owner.getGameMode() != GameMode.CREATIVE) {
+                ItemStack inHand = owner.getInventory().getItemInMainHand();
+                inHand.setAmount(inHand.getAmount() - 1);
+                owner.getInventory().setItemInMainHand(inHand.getAmount() > 0 ? inHand : new ItemStack(Material.AIR));
+            }
+            Job job = new Job(JobType.BLAST, where);
+            job.workers.addAll(workers);
+            job.tntLeft = workers.size() * Math.max(1, getConfig().getInt("army.tnt-per-npc", 2));
+            army.busy.addAll(workers);
+            army.jobs.add(job);
+            owner.sendActionBar(Component.text("NULL: blow it up.", NamedTextColor.DARK_RED));
+            return;
+        }
+
+        // bridge
+        List<Block> path = clicked != null ? bridgePathTo(owner, clicked) : bridgePathForward(owner);
+        if (path == null || path.isEmpty()) {
+            owner.sendActionBar(Component.text("NULL: nothing to bridge there.", NamedTextColor.RED));
+            return;
+        }
+        Location head = owner.getLocation();
+        List<NPC> workers = pickWorkers(army, head, Math.max(1, getConfig().getInt("army.bridge-workers", 3)));
+        if (workers.isEmpty()) {
+            owner.sendActionBar(Component.text("No free NULL.", NamedTextColor.RED));
+            return;
+        }
+        Job job = new Job(JobType.BRIDGE, head.clone());
+        job.path = path;
+        job.working = true;
+        job.workers.addAll(workers);
+        army.busy.addAll(workers);
+        army.jobs.add(job);
+        owner.sendActionBar(Component.text("NULL: building a bridge.", NamedTextColor.GRAY));
+    }
+
+    // plus-shaped column of bridge blocks, 3 wide, so the army can walk over it
+    private void addBridgeColumn(LinkedHashSet<Block> set, World w, int x, int y, int z) {
+        int[][] offsets = {{0, 0}, {1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+        for (int[] o : offsets) {
+            Block b = w.getBlockAt(x + o[0], y, z + o[1]);
+            if (b.getType().isSolid()) continue;       // already something to walk on
+            set.add(b);
+        }
+    }
+
+    // bridge from where the owner stands to the block they clicked
+    private List<Block> bridgePathTo(Player owner, Block dest) {
+        World w = dest.getWorld();
+        Location o = owner.getLocation();
+        if (!o.getWorld().equals(w)) return null;
+
+        int sx = o.getBlockX();
+        int sy = o.getBlockY() - 1;                      // the block the owner stands on
+        int sz = o.getBlockZ();
+        int dx = dest.getX() - sx;
+        int dz = dest.getZ() - sz;
+        int dy = dest.getY() - sy;
+        int len = Math.max(Math.abs(dx), Math.abs(dz));
+        int max = getConfig().getInt("army.bridge-max-length", 40);
+        if (len < 2 || len > max || Math.abs(dy) > len) return null;
+
+        LinkedHashSet<Block> set = new LinkedHashSet<>();
+        for (int i = 1; i < len; i++) {
+            double t = (double) i / len;
+            addBridgeColumn(set, w, (int) Math.round(sx + dx * t), (int) Math.round(sy + dy * t),
+                    (int) Math.round(sz + dz * t));
+        }
+        return new ArrayList<>(set);
+    }
+
+    // bridge straight ahead until the next solid ground (or a default length)
+    private List<Block> bridgePathForward(Player owner) {
+        World w = owner.getWorld();
+        Location o = owner.getLocation();
+        BlockFace face = owner.getFacing();
+        int sx = o.getBlockX();
+        int sy = o.getBlockY() - 1;
+        int sz = o.getBlockZ();
+        int max = getConfig().getInt("army.bridge-max-length", 40);
+
+        int end = -1;
+        boolean gap = false;
+        for (int i = 1; i <= max; i++) {
+            Block g = w.getBlockAt(sx + face.getModX() * i, sy, sz + face.getModZ() * i);
+            if (!g.getType().isSolid()) {
+                gap = true;
+            } else if (gap) {
+                end = i;
+                break;
+            }
+        }
+        int len = end > 0 ? end - 1 : Math.min(max, 16);
+
+        LinkedHashSet<Block> set = new LinkedHashSet<>();
+        for (int i = 1; i <= len; i++) {
+            addBridgeColumn(set, w, sx + face.getModX() * i, sy, sz + face.getModZ() * i);
+        }
+        return new ArrayList<>(set);
+    }
+
+    private Material bridgeMaterial() {
+        Material m = Material.matchMaterial(getConfig().getString("army.bridge-block", "COBBLESTONE"));
+        return (m == null || !m.isBlock() || m.isAir()) ? Material.COBBLESTONE : m;
+    }
+
+    // runs every 0.1s
+    private void jobTick(Player owner, Army army) {
+        if (army.dismissed || army.jobs.isEmpty()) return;
+
+        for (Job job : new ArrayList<>(army.jobs)) {
+            job.ticks += 2;
+            job.workers.removeIf(n -> !n.isSpawned());
+            if (job.workers.isEmpty() || job.ticks > JOB_MAX_TICKS) {
+                finishJob(army, job);
+                continue;
+            }
+
+            boolean done;
+            switch (job.type) {
+                case BURN -> done = burnTick(owner, army, job);
+                case BLAST -> done = blastTick(army, job);
+                default -> done = bridgeTick(owner, job);
+            }
+            if (done) finishJob(army, job);
+        }
+    }
+
+    private void finishJob(Army army, Job job) {
+        army.jobs.remove(job);
+        army.busy.removeAll(job.workers);
+        for (NPC n : job.workers) {
+            army.lastDest.remove(n);
+            army.lastPos.remove(n);
+            army.stuck.remove(n);
+        }
+    }
+
+    // walks the workers to the job site (true = everyone is there)
+    private boolean approach(Army army, Job job, double reach) {
+        boolean all = true;
+        for (NPC npc : job.workers) {
+            Location here = npc.getEntity().getLocation();
+            Location spot = slot(army, job.where, Math.max(0, army.npcs.indexOf(npc)), true);
+            if (!here.getWorld().equals(job.where.getWorld())) {
+                npc.teleport(spot, PlayerTeleportEvent.TeleportCause.PLUGIN);
+                all = false;
+                continue;
+            }
+            if (here.distanceSquared(job.where) > reach * reach) {
+                all = false;
+                if (job.ticks > 200) {
+                    npc.teleport(spot, PlayerTeleportEvent.TeleportCause.PLUGIN);   // taking too long: pop over
+                } else {
+                    walkTo(army, npc, npc.getNavigator(), here, spot);
+                }
+            }
+        }
+        return all;
+    }
+
+    private void swingAt(NPC npc, Location point) {
+        if (!npc.isSpawned()) return;
+        npc.faceLocation(point);
+        if (npc.getEntity() instanceof LivingEntity le) le.swingMainHand();
+    }
+
+    // ---- burn ----
+    private boolean burnTick(Player owner, Army army, Job job) {
+        if (!job.working) {
+            if (approach(army, job, 9)) job.working = true;
+            return false;
+        }
+        if (job.ticks % 6 != 0) return false;
+
+        int maxFires = getConfig().getInt("army.burn-max-fires", 40);
+        if (job.placed >= maxFires || job.misses >= 12) return true;
+
+        for (NPC npc : job.workers) {
+            Block spot = findFireSpot(job.where);
+            if (spot == null) {
+                job.misses++;
+                continue;
+            }
+            BlockIgniteEvent ev = new BlockIgniteEvent(spot, BlockIgniteEvent.IgniteCause.FLINT_AND_STEEL, owner);
+            Bukkit.getPluginManager().callEvent(ev);
+            if (ev.isCancelled()) {
+                job.misses++;
+                continue;
+            }
+            spot.setType(Material.FIRE);
+            job.placed++;
+            job.misses = 0;
+            spot.getWorld().playSound(spot.getLocation(), Sound.ITEM_FLINTANDSTEEL_USE, 0.8f, 1f);
+            swingAt(npc, spot.getLocation().add(0.5, 0.5, 0.5));
+        }
+        return false;
+    }
+
+    // an empty block next to something that burns (or, failing that, on the ground)
+    private Block findFireSpot(Location where) {
+        ThreadLocalRandom r = ThreadLocalRandom.current();
+        World w = where.getWorld();
+        BlockFace[] faces = {BlockFace.DOWN, BlockFace.NORTH, BlockFace.SOUTH, BlockFace.EAST, BlockFace.WEST, BlockFace.UP};
+
+        for (int i = 0; i < 24; i++) {
+            Block b = w.getBlockAt(where.getBlockX() + r.nextInt(-4, 5),
+                    where.getBlockY() + r.nextInt(-2, 4), where.getBlockZ() + r.nextInt(-4, 5));
+            if (!b.getType().isAir()) continue;
+            for (BlockFace f : faces) {
+                if (b.getRelative(f).getType().isFlammable()) return b;
+            }
+        }
+        for (int i = 0; i < 8; i++) {
+            Block b = w.getBlockAt(where.getBlockX() + r.nextInt(-3, 4), where.getBlockY(),
+                    where.getBlockZ() + r.nextInt(-3, 4));
+            if (b.getType().isAir() && b.getRelative(BlockFace.DOWN).getType().isSolid()) return b;
+        }
+        return null;
+    }
+
+    // ---- blow up ----
+    private boolean blastTick(Army army, Job job) {
+        if (!job.working) {
+            if (approach(army, job, 10)) job.working = true;
+            return false;
+        }
+        if (job.tntLeft <= 0) return true;
+        if (job.ticks % 6 != 0) return false;
+
+        NPC npc = job.workers.get(job.placed % job.workers.size());
+        ThreadLocalRandom r = ThreadLocalRandom.current();
+        Location at = job.where.clone().add(r.nextDouble(-0.8, 0.8), 0, r.nextDouble(-0.8, 0.8));
+        float yield = (float) getConfig().getDouble("army.tnt-yield", 4.0);
+
+        job.where.getWorld().spawn(at, TNTPrimed.class, t -> {
+            t.setFuseTicks(60);
+            t.setSource(npc.getEntity());
+            t.setYield(yield);
+        });
+        job.where.getWorld().playSound(at, Sound.ENTITY_TNT_PRIMED, 1f, 1f);
+        swingAt(npc, at);
+
+        job.placed++;
+        job.tntLeft--;
+        return false;
+    }
+
+    // ---- bridge ----
+    private boolean bridgeTick(Player owner, Job job) {
+        Material m = bridgeMaterial();
+        Block head = null;
+        boolean sounded = false;
+
+        for (int k = 0; k < BRIDGE_BLOCKS_PER_STEP && job.next < job.path.size(); k++) {
+            Block b = job.path.get(job.next++);
+            if (!(b.getType().isAir() || b.isLiquid() || b.isPassable())) continue;
+            if (!allowedToBuild(owner, b)) {
+                job.misses++;
+                continue;
+            }
+            b.setType(m);
+            head = b;
+            if (!sounded) {
+                b.getWorld().playSound(b.getLocation(), b.getBlockData().getSoundGroup().getPlaceSound(), 1f, 1f);
+                sounded = true;
+            }
+        }
+
+        if (head != null) {
+            int i = 0;
+            for (NPC npc : job.workers) {
+                // the builders stand on the end of the bridge as it grows
+                npc.teleport(head.getLocation().add(0.5 + (i - 1) * 0.8, 1, 0.5), PlayerTeleportEvent.TeleportCause.PLUGIN);
+                if (job.next < job.path.size()) {
+                    swingAt(npc, job.path.get(job.next).getLocation().add(0.5, 1, 0.5));
+                } else if (npc.getEntity() instanceof LivingEntity le) {
+                    le.swingMainHand();
+                }
+                i++;
+            }
+        }
+        return job.next >= job.path.size() || job.misses > 40;
     }
 
     // ---------- elytra-mace flight ----------
@@ -1135,7 +1616,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
 
     // decides where one NPC should be heading
     private void steerOne(Player owner, Army army, NPC npc, LivingEntity target) {
-        if (!npc.isSpawned()) return;
+        if (!npc.isSpawned() || army.busy.contains(npc)) return;
         Navigator nav = npc.getNavigator();
         Location here = npc.getEntity().getLocation();
         int index = Math.max(0, army.npcs.indexOf(npc));
@@ -1394,6 +1875,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         if (army.spawnTask != null) army.spawnTask.cancel();
         if (army.lookTask != null) army.lookTask.cancel();
         if (army.flightTask != null) army.flightTask.cancel();
+        if (army.jobTask != null) army.jobTask.cancel();
 
         Location where = null;
         for (NPC npc : army.npcs) {
@@ -1405,7 +1887,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         // close any portals that are still open (puts the old blocks back)
         for (Portal p : army.portals) closePortal(p);
 
-        // remove blocks the army placed
+        // remove blocks the army placed while chasing (bridges you ordered stay)
         for (Block b : army.placed) {
             if (b.getType() == army.placedType) b.setType(Material.AIR);
         }
@@ -1423,4 +1905,4 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
     public void onDeath(PlayerDeathEvent e) {
         dismiss(e.getPlayer().getUniqueId(), false);
     }
-                                          }
+        }
