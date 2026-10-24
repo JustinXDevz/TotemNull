@@ -3,13 +3,21 @@ version: 1.0.0
 main: com.example.totemnull.TotemNull
 api-version: '26.1'
 depend: [Citizens]
-description: Totem of NULL - hit a player, blow the Call horn, NULL hunts them down.
+description: Totem of NULL - command the NULL army with the Call horn or /nullcall.
 commands:
   totemnull:
     description: Give yourself (or someone) the Totem of NULL
     usage: /totemnull [player]
     permission: totemnull.give
+  nullcall:
+    description: Summon or dismiss the NULL army (works on Java and Bedrock)
+    usage: /nullcall
+    aliases: [nullarmy]
+    permission: totemnull.use
 permissions:
   totemnull.give:
     description: Allows /totemnull
     default: op
+  totemnull.use:
+    description: Allows /nullcall
+    default: true
