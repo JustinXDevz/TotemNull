@@ -14,10 +14,15 @@ commands:
     usage: /nullcall
     aliases: [nullarmy]
     permission: totemnull.use
+  nullform:
+    description: Change the NULL formation
+    usage: /nullform <ring|charge|scatter>
+    aliases: [nullformation]
+    permission: totemnull.use
 permissions:
   totemnull.give:
     description: Allows /totemnull
     default: op
   totemnull.use:
-    description: Allows /nullcall
+    description: Allows /nullcall and /nullform
     default: true
