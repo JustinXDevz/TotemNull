@@ -1,6 +1,7 @@
 package com.example.totemnull;
 
 import net.citizensnpcs.api.CitizensAPI;
+import net.citizensnpcs.api.ai.Navigator;
 import net.citizensnpcs.api.npc.MemoryNPCDataStore;
 import net.citizensnpcs.api.npc.NPC;
 import net.citizensnpcs.api.npc.NPCRegistry;
@@ -44,12 +45,16 @@ import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.inventory.meta.MusicInstrumentMeta;
 import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.potion.PotionEffect;
+import org.bukkit.potion.PotionEffectType;
 import org.bukkit.scheduler.BukkitTask;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
 
@@ -57,15 +62,20 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
 
     private static final long TARGET_WINDOW_MS = 30_000; // a hit/attack counts as "target" for this long before summoning
     private static final long HORN_DEBOUNCE_MS = 700;
+    private static final double ENGAGE_DIST = 9;     // closer than this to the target: charge and attack
+    private static final double DISENGAGE_DIST = 13; // farther than this: go back to formation walking
 
     private static class Army {
         final List<NPC> npcs = new ArrayList<>();
         final Map<NPC, Location> lastPos = new HashMap<>();
+        final Map<NPC, Location> lastDest = new HashMap<>();
         final Map<NPC, Integer> stuck = new HashMap<>();
+        final Set<NPC> engaged = new HashSet<>();
         final List<Block> placed = new ArrayList<>();
         Material placedType = Material.COBBLESTONE;
         UUID targetId;      // null = following owner
         BukkitTask task;
+        BukkitTask spawnTask;
         int ticks = 0;
     }
 
@@ -150,14 +160,21 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         return false;
     }
 
+    // registry key of the horn's sound, e.g. "minecraft:call_goat_horn"
+    private String instrumentKey(ItemStack item) {
+        if (item != null && item.hasItemMeta()
+                && item.getItemMeta() instanceof MusicInstrumentMeta mim && mim.getInstrument() != null) {
+            NamespacedKey key = Registry.INSTRUMENT.getKey(mim.getInstrument());
+            return key == null ? "unknown" : key.toString();
+        }
+        return "none";
+    }
+
     // A goat horn counts if it is the "Call" horn OR renamed to "call"
     private boolean isCallHorn(ItemStack item) {
         if (item == null || item.getType() != Material.GOAT_HORN || !item.hasItemMeta()) return false;
+        if (instrumentKey(item).contains("call")) return true;
         ItemMeta meta = item.getItemMeta();
-        if (meta instanceof MusicInstrumentMeta mim && mim.getInstrument() != null) {
-            NamespacedKey key = Registry.INSTRUMENT.getKey(mim.getInstrument());
-            if (key != null && key.getKey().equals("call")) return true;
-        }
         if (meta.hasDisplayName()) {
             String name = PlainTextComponentSerializer.plainText().serialize(meta.displayName());
             return name.trim().equalsIgnoreCase("call");
@@ -234,9 +251,10 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         Player owner = e.getPlayer();
         boolean callHorn = isCallHorn(item);
 
-        if (getConfig().getBoolean("debug", true)) {
+        if (getConfig().getBoolean("debug", false)) {
             getLogger().info("[debug] " + owner.getName() + " goat horn click: action=" + e.getAction()
-                    + " hand=" + e.getHand() + " callHorn=" + callHorn + " totem=" + hasTotem(owner));
+                    + " hand=" + e.getHand() + " instrument=" + instrumentKey(item)
+                    + " callHorn=" + callHorn + " totem=" + hasTotem(owner));
         }
 
         boolean rightClick = e.getAction() == Action.RIGHT_CLICK_AIR || e.getAction() == Action.RIGHT_CLICK_BLOCK;
@@ -263,19 +281,38 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         }
     }
 
-    // ---------- army ----------
+    // ---------- gear ----------
+    private ItemStack enchanted(Material type, Object... pairs) {
+        ItemStack item = new ItemStack(type);
+        ItemMeta m = item.getItemMeta();
+        for (int i = 0; i + 1 < pairs.length; i += 2) {
+            m.addEnchant((Enchantment) pairs[i], (Integer) pairs[i + 1], true);
+        }
+        item.setItemMeta(m);
+        return item;
+    }
+
     private ItemStack nullSword() {
-        ItemStack sword = new ItemStack(Material.NETHERITE_SWORD);
-        ItemMeta m = sword.getItemMeta();
-        m.addEnchant(Enchantment.SHARPNESS, 5, true);
-        m.addEnchant(Enchantment.UNBREAKING, 3, true);
-        m.addEnchant(Enchantment.MENDING, 1, true);
-        m.addEnchant(Enchantment.FIRE_ASPECT, 2, true);
-        m.addEnchant(Enchantment.LOOTING, 3, true);
-        m.addEnchant(Enchantment.KNOCKBACK, 2, true);
-        m.addEnchant(Enchantment.SWEEPING_EDGE, 3, true);
-        sword.setItemMeta(m);
-        return sword;
+        return enchanted(Material.NETHERITE_SWORD,
+                Enchantment.SHARPNESS, 5, Enchantment.UNBREAKING, 3, Enchantment.MENDING, 1,
+                Enchantment.FIRE_ASPECT, 2, Enchantment.LOOTING, 3, Enchantment.KNOCKBACK, 2,
+                Enchantment.SWEEPING_EDGE, 3);
+    }
+
+    private void equipArmor(Equipment eq) {
+        eq.set(Equipment.EquipmentSlot.HELMET, enchanted(Material.NETHERITE_HELMET,
+                Enchantment.PROTECTION, 4, Enchantment.UNBREAKING, 3, Enchantment.MENDING, 1,
+                Enchantment.THORNS, 3, Enchantment.RESPIRATION, 3, Enchantment.AQUA_AFFINITY, 1));
+        eq.set(Equipment.EquipmentSlot.CHESTPLATE, enchanted(Material.NETHERITE_CHESTPLATE,
+                Enchantment.PROTECTION, 4, Enchantment.UNBREAKING, 3, Enchantment.MENDING, 1,
+                Enchantment.THORNS, 3));
+        eq.set(Equipment.EquipmentSlot.LEGGINGS, enchanted(Material.NETHERITE_LEGGINGS,
+                Enchantment.PROTECTION, 4, Enchantment.UNBREAKING, 3, Enchantment.MENDING, 1,
+                Enchantment.THORNS, 3, Enchantment.SWIFT_SNEAK, 3));
+        eq.set(Equipment.EquipmentSlot.BOOTS, enchanted(Material.NETHERITE_BOOTS,
+                Enchantment.PROTECTION, 4, Enchantment.UNBREAKING, 3, Enchantment.MENDING, 1,
+                Enchantment.THORNS, 3, Enchantment.FEATHER_FALLING, 4, Enchantment.DEPTH_STRIDER, 3,
+                Enchantment.SOUL_SPEED, 3));
     }
 
     // names like "Xgafdiwn12": capital letter, lowercase letters, then 1-2 digits
@@ -298,38 +335,70 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         }
     }
 
-    private Location nearOwner(Location o) {
-        ThreadLocalRandom r = ThreadLocalRandom.current();
-        return o.clone().add(r.nextDouble(-4, 4), 0, r.nextDouble(-4, 4));
+    // ---------- army ----------
+
+    // spread-out spot number <index> around a centre (sunflower pattern, ~2 blocks apart)
+    private Location slot(Location center, int index) {
+        double angle = index * 2.399963;
+        double radius = 2.5 + 0.9 * Math.sqrt(index);
+        Location l = center.clone().add(Math.cos(angle) * radius, 0, Math.sin(angle) * radius);
+        if (!l.getBlock().isPassable()) return center.clone(); // spot is inside a wall: use the centre
+        return l;
     }
 
     private void summon(Player owner) {
         Army army = new Army();
-        int size = Math.max(1, Math.min(60, getConfig().getInt("army.size", 15)));
+        final int size = Math.max(1, Math.min(60, getConfig().getInt("army.size", 15)));
+        final long interval = Math.max(1L, getConfig().getLong("army.spawn-interval-ticks", 6L));
 
-        for (int i = 0; i < size; i++) {
-            NPC npc = registry.createNPC(EntityType.PLAYER, gibberishName());
-            npc.setProtected(false); // can be killed
-            npc.getOrAddTrait(Equipment.class).set(Equipment.EquipmentSlot.HAND, nullSword());
-            applySkin(npc);
-            npc.getNavigator().getDefaultParameters().range(100f).speedModifier(1.2f);
-            npc.spawn(nearOwner(owner.getLocation()));
-            army.npcs.add(npc);
-        }
+        LivingEntity first = recentTarget(owner);
+        army.targetId = first == null ? null : first.getUniqueId();
         armies.put(owner.getUniqueId(), army);
-        command(owner, army, recentTarget(owner));
         owner.getWorld().playSound(owner.getLocation(), Sound.ENTITY_WITHER_SPAWN, 0.6f, 1.4f);
+
+        // they appear one by one
+        army.spawnTask = Bukkit.getScheduler().runTaskTimer(this, () -> {
+            if (!owner.isOnline() || owner.isDead() || army.npcs.size() >= size) {
+                army.spawnTask.cancel();
+                return;
+            }
+            spawnOne(owner, army);
+        }, 0L, interval);
 
         army.task = Bukkit.getScheduler().runTaskTimer(this, () -> tickArmy(owner, army), 10L, 10L);
     }
 
-    // target == null -> follow the owner, otherwise attack target
+    private void spawnOne(Player owner, Army army) {
+        int index = army.npcs.size();
+        NPC npc = registry.createNPC(EntityType.PLAYER, gibberishName());
+        npc.setProtected(false); // can be killed
+
+        Equipment eq = npc.getOrAddTrait(Equipment.class);
+        eq.set(Equipment.EquipmentSlot.HAND, nullSword());
+        if (getConfig().getBoolean("army.armor", true)) equipArmor(eq);
+
+        applySkin(npc);
+        npc.getNavigator().getDefaultParameters().range(100f).speedModifier(1.2f);
+
+        Location at = slot(owner.getLocation(), index);
+        npc.spawn(at);
+
+        if (getConfig().getBoolean("army.effects", true) && npc.getEntity() instanceof LivingEntity le) {
+            le.addPotionEffect(new PotionEffect(PotionEffectType.STRENGTH, PotionEffect.INFINITE_DURATION, 1, false, false));
+            le.addPotionEffect(new PotionEffect(PotionEffectType.RESISTANCE, PotionEffect.INFINITE_DURATION, 0, false, false));
+        }
+
+        army.npcs.add(npc);
+        at.getWorld().playSound(at, Sound.ENTITY_ENDERMAN_TELEPORT, 0.5f, 1.2f);
+    }
+
+    // new target (or null = follow the owner)
     private void command(Player owner, Army army, LivingEntity target) {
         army.targetId = target == null ? null : target.getUniqueId();
+        army.engaged.clear();
+        army.lastDest.clear();
         for (NPC npc : army.npcs) {
-            if (!npc.isSpawned()) continue;
-            if (target == null) npc.getNavigator().setTarget(owner, false);
-            else npc.getNavigator().setTarget(target, true);
+            if (npc.isSpawned()) steerOne(owner, army, npc, target);
         }
     }
 
@@ -344,36 +413,77 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         LivingEntity target = liveTarget(owner, army.targetId);
         if (army.targetId != null && target == null) {
             command(owner, army, null);                 // target died / left: follow owner again
-        } else if (army.ticks % 100 == 0) {
-            command(owner, army, target);               // refresh navigation now and then
         }
 
         for (NPC npc : army.npcs) {
             if (!npc.isSpawned()) continue;
-            Location here = npc.getEntity().getLocation();
-            if (target == null) {
+            steerOne(owner, army, npc, target);
+            if (target != null) {
+                pursue(owner, army, npc, npc.getEntity().getLocation(), target);
+            } else {
                 army.stuck.remove(npc);
                 army.lastPos.remove(npc);
-                keepNearOwner(owner, npc, here);
-            } else {
-                pursue(owner, army, npc, here, target);
             }
         }
     }
 
-    private void keepNearOwner(Player owner, NPC npc, Location here) {
+    // decides where one NPC should be heading
+    private void steerOne(Player owner, Army army, NPC npc, LivingEntity target) {
+        Navigator nav = npc.getNavigator();
+        Location here = npc.getEntity().getLocation();
+        int index = Math.max(0, army.npcs.indexOf(npc));
+
+        if (target != null) {
+            Location tl = target.getLocation();
+            if (!here.getWorld().equals(tl.getWorld())) return;   // pursue() teleports it over
+            double d = here.distance(tl);
+            boolean engaged = army.engaged.contains(npc);
+
+            if (engaged && d > DISENGAGE_DIST) {
+                army.engaged.remove(npc);
+                army.lastDest.remove(npc);
+                engaged = false;
+            }
+            if (!engaged && d <= ENGAGE_DIST) {
+                army.engaged.add(npc);
+                nav.setTarget(target, true);              // close enough: charge and attack
+                return;
+            }
+            if (engaged) {
+                if (!nav.isNavigating()) nav.setTarget(target, true);
+                return;
+            }
+            walkTo(army, npc, nav, here, slot(tl, index)); // far away: walk in formation
+            return;
+        }
+
+        // no target: follow the owner, each NPC in its own spot
         Location o = owner.getLocation();
         if (!here.getWorld().equals(o.getWorld()) || here.distanceSquared(o) > 40 * 40) {
-            npc.teleport(nearOwner(o), PlayerTeleportEvent.TeleportCause.PLUGIN);
-            npc.getNavigator().setTarget(owner, false);
+            npc.teleport(slot(o, index), PlayerTeleportEvent.TeleportCause.PLUGIN);
+            army.lastDest.remove(npc);
+            return;
+        }
+        walkTo(army, npc, nav, here, slot(o, index));
+    }
+
+    private void walkTo(Army army, NPC npc, Navigator nav, Location here, Location dest) {
+        if (here.getWorld().equals(dest.getWorld()) && here.distanceSquared(dest) <= 4) return; // already there
+        Location prev = army.lastDest.get(npc);
+        boolean destMoved = prev == null || !prev.getWorld().equals(dest.getWorld())
+                || prev.distanceSquared(dest) > 2.25;
+        if (destMoved || !nav.isNavigating()) {
+            army.lastDest.put(npc, dest.clone());
+            nav.setTarget(dest);
         }
     }
 
     private void pursue(Player owner, Army army, NPC npc, Location here, LivingEntity target) {
         Location to = target.getLocation();
         if (!here.getWorld().equals(to.getWorld())) {
-            npc.teleport(nearOwner(owner.getLocation()), PlayerTeleportEvent.TeleportCause.PLUGIN);
-            npc.getNavigator().setTarget(target, true);
+            npc.teleport(slot(owner.getLocation(), Math.max(0, army.npcs.indexOf(npc))),
+                    PlayerTeleportEvent.TeleportCause.PLUGIN);
+            army.lastDest.remove(npc);
             return;
         }
 
@@ -488,6 +598,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         Army army = armies.remove(ownerId);
         if (army == null) return;
         if (army.task != null) army.task.cancel();
+        if (army.spawnTask != null) army.spawnTask.cancel();
 
         Location where = null;
         for (NPC npc : army.npcs) {
@@ -512,4 +623,4 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
     public void onDeath(PlayerDeathEvent e) {
         dismiss(e.getPlayer().getUniqueId(), false);
     }
-    }
+                                  }
