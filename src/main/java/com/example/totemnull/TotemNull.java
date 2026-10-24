@@ -6,6 +6,7 @@ import net.citizensnpcs.api.npc.MemoryNPCDataStore;
 import net.citizensnpcs.api.npc.NPC;
 import net.citizensnpcs.api.npc.NPCRegistry;
 import net.citizensnpcs.api.trait.trait.Equipment;
+import net.citizensnpcs.trait.LookClose;
 import net.citizensnpcs.trait.SkinTrait;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
@@ -48,6 +49,7 @@ import org.bukkit.event.block.BlockBreakEvent;
 import org.bukkit.event.block.BlockPlaceEvent;
 import org.bukkit.event.entity.CreatureSpawnEvent;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
+import org.bukkit.event.entity.EntityDeathEvent;
 import org.bukkit.event.entity.EntityPortalEvent;
 import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.player.PlayerInteractEntityEvent;
@@ -80,6 +82,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
     private static final long TARGET_WINDOW_MS = 30_000; // a hit/attack counts as "target" for this long before summoning
     private static final long HORN_DEBOUNCE_MS = 700;
     private static final long MARK_LOCK_MS = 10_000;     // a manual mark beats automatic targeting for this long
+    private static final long TICK = 5L;                 // how often the army "thinks" (5 ticks = 0.25 s)
     private static final double ARCHER_RANGE = 16;
     private static final long ARCHER_COOLDOWN_MS = 1_500;
     private static final double ARROW_DAMAGE = 4.0;
@@ -87,10 +90,13 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
     private static final long PORTAL_STAY_TICKS = 45;    // ...and stays open this long after
     private static final double PORTAL_MIN_DIST = 6;
     private static final double PORTAL_MAX_DIST = 14;
+    private static final double MACE_LAUNCH_MIN = 14;    // elytra-mace NULL take off when the target is this far...
+    private static final double MACE_LAUNCH_MAX = 60;    // ...and not farther than this
+    private static final int MACE_FLIGHT_MAX_TICKS = 80;
 
     private enum Formation { RING, CHARGE, SCATTER }
 
-    private enum Role { CAPTAIN, SWORD, AXE, ARCHER }
+    private enum Role { CAPTAIN, SWORD, AXE, ARCHER, MACE }
 
     // a temporary nether portal used as an entrance
     private static class Portal {
@@ -99,25 +105,43 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         boolean closed = false;
     }
 
+    // one elytra-mace dive
+    private static class Flight {
+        int phase = 0;        // 0 = climbing, 1 = diving
+        int ticks = 0;
+        int diveTicks = 0;
+        double apexY;
+    }
+
     private static class Army {
         final List<NPC> npcs = new ArrayList<>();
         final Map<NPC, Role> roles = new HashMap<>();
+        final Map<UUID, NPC> byEntity = new HashMap<>();
         final Map<NPC, Location> lastPos = new HashMap<>();
         final Map<NPC, Location> lastDest = new HashMap<>();
         final Map<NPC, Integer> stuck = new HashMap<>();
         final Map<NPC, Long> lastShot = new HashMap<>();
+        final Map<NPC, Location> focus = new HashMap<>();   // block an NPC is working on
+        final Map<NPC, Long> busyUntil = new HashMap<>();
+        final Map<NPC, Flight> flights = new HashMap<>();   // elytra-mace NULL that are in the air
+        final Map<NPC, Long> maceReady = new HashMap<>();   // when a mace NULL may take off again
         final Set<NPC> engaged = new HashSet<>();
         final List<Block> placed = new ArrayList<>();
         final List<Portal> portals = new ArrayList<>();
         Material placedType = Material.COBBLESTONE;
         Formation formation = Formation.RING;
+        Location rally;      // null = follow the owner
         boolean captain = true;
         boolean dismissed = false;
-        int size = 15;
-        int pending = 0;    // NULL whose portal is open but who has not stepped out yet
-        UUID targetId;      // null = following owner
+        int size = 20;       // total NULL (normal + mace)
+        int baseCount = 15;  // NULL before the mace ones
+        int pending = 0;     // NULL whose portal is open but who has not stepped out yet
+        int replacements = 0;
+        UUID targetId;       // null = no target
         BukkitTask task;
         BukkitTask spawnTask;
+        BukkitTask lookTask;
+        BukkitTask flightTask;
         int ticks = 0;
     }
 
@@ -132,6 +156,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
     private final Map<UUID, Long> lastTargetTime = new HashMap<>();
     private final Map<UUID, Long> markLock = new HashMap<>();
     private final Map<UUID, Long> lastMark = new HashMap<>();
+    private final Map<UUID, Long> lastRally = new HashMap<>();
     private final Map<UUID, Long> lastHorn = new HashMap<>();
 
     @Override
@@ -332,6 +357,45 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         owner.playSound(owner.getLocation(), Sound.ENTITY_EXPERIENCE_ORB_PICKUP, 0.7f, 0.6f);
     }
 
+    // sneak + right-click a block with the totem = rally point, sneak + right-click the air = follow me again
+    @EventHandler
+    public void onRally(PlayerInteractEvent e) {
+        if (e.getHand() != EquipmentSlot.HAND) return;
+        Action action = e.getAction();
+        if (action != Action.RIGHT_CLICK_BLOCK && action != Action.RIGHT_CLICK_AIR) return;
+
+        Player owner = e.getPlayer();
+        if (!owner.isSneaking() || isNpc(owner) || !isTotem(e.getItem())) return;
+
+        long now = System.currentTimeMillis();
+        if (now - lastRally.getOrDefault(owner.getUniqueId(), 0L) < 400) return;
+        lastRally.put(owner.getUniqueId(), now);
+
+        Army army = armies.get(owner.getUniqueId());
+        if (army == null) {
+            owner.sendActionBar(Component.text("Blow the Call horn first.", NamedTextColor.RED));
+            return;
+        }
+        e.setCancelled(true);
+
+        if (action == Action.RIGHT_CLICK_BLOCK && e.getClickedBlock() != null) {
+            Location spot = e.getClickedBlock().getLocation().add(0.5, 1, 0.5);
+            army.rally = spot;
+            spot.getWorld().spawnParticle(Particle.PORTAL, spot.clone().add(0, 0.6, 0), 50, 0.5, 0.6, 0.5, 0.3);
+            spot.getWorld().playSound(spot, Sound.BLOCK_PORTAL_TRIGGER, 0.4f, 1.6f);
+            owner.sendActionBar(Component.text("NULL rally point set.", NamedTextColor.DARK_GRAY));
+        } else {
+            army.rally = null;
+            owner.sendActionBar(Component.text("NULL follow you again.", NamedTextColor.DARK_GRAY));
+        }
+
+        army.lastDest.clear();
+        LivingEntity t = liveTarget(owner, army.targetId);
+        for (NPC npc : army.npcs) {
+            if (npc.isSpawned() && !army.flights.containsKey(npc)) steerOne(owner, army, npc, t);
+        }
+    }
+
     private void noteTarget(Player owner, Entity target, boolean manual) {
         UUID oid = owner.getUniqueId();
         long now = System.currentTimeMillis();
@@ -437,13 +501,27 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         };
     }
 
+    private ItemStack maceItem() {
+        return enchanted(Material.MACE,
+                Enchantment.DENSITY, 5, Enchantment.WIND_BURST, 3, Enchantment.FIRE_ASPECT, 2,
+                Enchantment.UNBREAKING, 3, Enchantment.MENDING, 1);
+    }
+
+    private ItemStack elytraItem() {
+        return enchanted(Material.ELYTRA, Enchantment.UNBREAKING, 3, Enchantment.MENDING, 1);
+    }
+
+    private ItemStack chestplate() {
+        return enchanted(Material.NETHERITE_CHESTPLATE,
+                Enchantment.PROTECTION, 4, Enchantment.UNBREAKING, 3, Enchantment.MENDING, 1,
+                Enchantment.THORNS, 3);
+    }
+
     private void equipArmor(Equipment eq) {
         eq.set(Equipment.EquipmentSlot.HELMET, enchanted(Material.NETHERITE_HELMET,
                 Enchantment.PROTECTION, 4, Enchantment.UNBREAKING, 3, Enchantment.MENDING, 1,
                 Enchantment.THORNS, 3, Enchantment.RESPIRATION, 3, Enchantment.AQUA_AFFINITY, 1));
-        eq.set(Equipment.EquipmentSlot.CHESTPLATE, enchanted(Material.NETHERITE_CHESTPLATE,
-                Enchantment.PROTECTION, 4, Enchantment.UNBREAKING, 3, Enchantment.MENDING, 1,
-                Enchantment.THORNS, 3));
+        eq.set(Equipment.EquipmentSlot.CHESTPLATE, chestplate());
         eq.set(Equipment.EquipmentSlot.LEGGINGS, enchanted(Material.NETHERITE_LEGGINGS,
                 Enchantment.PROTECTION, 4, Enchantment.UNBREAKING, 3, Enchantment.MENDING, 1,
                 Enchantment.THORNS, 3, Enchantment.SWIFT_SNEAK, 3));
@@ -451,6 +529,14 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
                 Enchantment.PROTECTION, 4, Enchantment.UNBREAKING, 3, Enchantment.MENDING, 1,
                 Enchantment.THORNS, 3, Enchantment.FEATHER_FALLING, 4, Enchantment.DEPTH_STRIDER, 3,
                 Enchantment.SOUL_SPEED, 3));
+    }
+
+    // elytra-mace style = elytra + mace, normal style = netherite chestplate + sword
+    private void equipStyle(NPC npc, boolean elytraMace) {
+        if (!npc.isSpawned()) return;
+        Equipment eq = npc.getOrAddTrait(Equipment.class);
+        eq.set(Equipment.EquipmentSlot.CHESTPLATE, elytraMace ? elytraItem() : chestplate());
+        eq.set(Equipment.EquipmentSlot.HAND, elytraMace ? maceItem() : weaponFor(Role.SWORD));
     }
 
     // names like "Xgafdiwn12": capital letter, lowercase letters, then 1-2 digits
@@ -600,7 +686,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         };
     }
 
-    // where NULL number <index> stands around a centre (the owner, or the target)
+    // where NULL number <index> stands around a centre (the owner, the rally point, or the target)
     private Location slot(Army army, Location center, int index, boolean atTarget) {
         double x;
         double z;
@@ -631,6 +717,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
     }
 
     private Role roleFor(Army army, int index) {
+        if (index >= army.baseCount) return Role.MACE;          // the extra elytra-mace NULL
         if (army.captain && index == 0) return Role.CAPTAIN;
         if (!getConfig().getBoolean("army.mixed-weapons", true)) return Role.SWORD;
         return switch (index % 3) {
@@ -642,9 +729,12 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
 
     private void summon(Player owner) {
         Army army = new Army();
-        final int size = Math.max(1, Math.min(60, getConfig().getInt("army.size", 15)));
+        final int base = Math.max(1, Math.min(60, getConfig().getInt("army.size", 15)));
+        final int maces = Math.max(0, Math.min(20, getConfig().getInt("army.mace-count", 5)));
+        final int total = base + maces;
         final long interval = Math.max(1L, getConfig().getLong("army.spawn-interval-ticks", 6L));
-        army.size = size;
+        army.baseCount = base;
+        army.size = total;
         army.captain = getConfig().getBoolean("army.captain", true);
         army.formation = formations.getOrDefault(owner.getUniqueId(), configFormation());
 
@@ -655,19 +745,22 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
 
         // one entrance after another
         army.spawnTask = Bukkit.getScheduler().runTaskTimer(this, () -> {
-            if (!owner.isOnline() || owner.isDead() || army.npcs.size() + army.pending >= size) {
+            if (!owner.isOnline() || owner.isDead() || army.npcs.size() + army.pending >= total) {
                 army.spawnTask.cancel();
                 return;
             }
-            scheduleEntrance(owner, army);
+            enter(owner, army, -1, true);
         }, 0L, interval);
 
-        army.task = Bukkit.getScheduler().runTaskTimer(this, () -> tickArmy(owner, army), 10L, 10L);
+        army.task = Bukkit.getScheduler().runTaskTimer(this, () -> tickArmy(owner, army), TICK, TICK);
+        army.lookTask = Bukkit.getScheduler().runTaskTimer(this, () -> lookTick(owner, army), 2L, 2L);
+        army.flightTask = Bukkit.getScheduler().runTaskTimer(this, () -> flightTick(owner, army), 1L, 1L);
     }
 
     // opens a portal, then a moment later the NULL steps out of it
-    private void scheduleEntrance(Player owner, Army army) {
-        army.pending++;
+    // forcedIndex >= 0 means "replace the NULL in that slot", -1 means "a new one"
+    private void enter(Player owner, Army army, int forcedIndex, boolean initial) {
+        if (initial) army.pending++;
 
         final Portal portal = getConfig().getBoolean("army.portals", true) ? openPortal(owner) : null;
         if (portal != null) {
@@ -680,9 +773,9 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
 
         long delay = portal != null ? PORTAL_OPEN_TICKS : 1L;
         Bukkit.getScheduler().runTaskLater(this, () -> {
-            army.pending--;
+            if (initial) army.pending--;
             if (army.dismissed || !owner.isOnline() || owner.isDead()) return;
-            spawnOne(owner, army, portal == null ? null : portal.center);
+            spawnOne(owner, army, portal == null ? null : portal.center, forcedIndex);
         }, delay);
 
         if (portal != null) {
@@ -690,8 +783,8 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         }
     }
 
-    private void spawnOne(Player owner, Army army, Location at) {
-        int index = army.npcs.size();
+    private void spawnOne(Player owner, Army army, Location at, int forcedIndex) {
+        int index = forcedIndex >= 0 ? forcedIndex : army.npcs.size();
         Role role = roleFor(army, index);
 
         String name = gibberishName();
@@ -702,12 +795,19 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
 
         Equipment eq = npc.getOrAddTrait(Equipment.class);
         eq.set(Equipment.EquipmentSlot.HAND, weaponFor(role));
-        if (getConfig().getBoolean("army.armor", true)) equipArmor(eq);
+        if (getConfig().getBoolean("army.armor", true) || role == Role.MACE) equipArmor(eq);
+
+        // looks at nearby players like a real player would
+        LookClose look = npc.getOrAddTrait(LookClose.class);
+        look.lookClose(true);
+        look.setRange(10);
+        look.setRealisticLooking(true);
 
         applySkin(npc);
         npc.getNavigator().getDefaultParameters().range(100f).speedModifier(1.2f);
 
-        Location spawnAt = at != null ? at.clone() : slot(army, owner.getLocation(), index, false);
+        Location center = army.rally != null ? army.rally : owner.getLocation();
+        Location spawnAt = at != null ? at.clone() : slot(army, center, index, false);
         npc.spawn(spawnAt);
 
         if (npc.getEntity() instanceof LivingEntity le) {
@@ -727,10 +827,19 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
                 }
             }
             npcOwner.put(le.getUniqueId(), owner.getUniqueId());
+            army.byEntity.put(le.getUniqueId(), npc);
         }
 
-        army.npcs.add(npc);
+        if (forcedIndex >= 0 && forcedIndex < army.npcs.size()) {
+            NPC old = army.npcs.get(forcedIndex);   // the killed one: swap it out
+            army.roles.remove(old);
+            old.destroy();
+            army.npcs.set(forcedIndex, npc);
+        } else {
+            army.npcs.add(npc);
+        }
         army.roles.put(npc, role);
+
         spawnAt.getWorld().playSound(spawnAt, Sound.ENTITY_ENDERMAN_TELEPORT, 0.5f, 1.2f);
         if (at != null) {
             spawnAt.getWorld().spawnParticle(Particle.PORTAL, spawnAt.clone().add(0, 1, 0), 40, 0.3, 0.8, 0.3, 0.3);
@@ -740,40 +849,289 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         steerOne(owner, army, npc, liveTarget(owner, army.targetId));
     }
 
-    // new target (or null = follow the owner)
+    // a NULL was killed: clean up and (if enabled) send a replacement through a new portal
+    @EventHandler
+    public void onNullDeath(EntityDeathEvent e) {
+        UUID entityId = e.getEntity().getUniqueId();
+        UUID ownerId = npcOwner.get(entityId);
+        if (ownerId == null) return;
+
+        e.getDrops().clear();
+        e.setDroppedExp(0);
+        npcOwner.remove(entityId);
+
+        Army army = armies.get(ownerId);
+        Player owner = Bukkit.getPlayer(ownerId);
+        if (army == null || army.dismissed || owner == null) return;
+
+        NPC dead = army.byEntity.remove(entityId);
+        if (dead == null) return;
+        int index = army.npcs.indexOf(dead);
+
+        army.engaged.remove(dead);
+        army.stuck.remove(dead);
+        army.lastPos.remove(dead);
+        army.lastDest.remove(dead);
+        army.focus.remove(dead);
+        army.busyUntil.remove(dead);
+        army.flights.remove(dead);
+        army.maceReady.remove(dead);
+
+        if (index >= 0) queueReplacement(owner, army, index);
+    }
+
+    private void queueReplacement(Player owner, Army army, int index) {
+        if (!getConfig().getBoolean("army.replace-killed", true)) return;
+        int max = getConfig().getInt("army.max-replacements", 30);
+        if (max > 0 && army.replacements >= max) return;
+        army.replacements++;
+
+        long delay = Math.max(20L, getConfig().getLong("army.replace-delay-ticks", 80L));
+        Bukkit.getScheduler().runTaskLater(this, () -> {
+            if (army.dismissed || !owner.isOnline() || owner.isDead()) return;
+            enter(owner, army, index, false);
+        }, delay);
+    }
+
+    // new target (or null = no target: follow the owner / hold the rally point)
     private void command(Player owner, Army army, LivingEntity target) {
         army.targetId = target == null ? null : target.getUniqueId();
         army.engaged.clear();
         army.lastDest.clear();
         for (NPC npc : army.npcs) {
-            if (npc.isSpawned()) steerOne(owner, army, npc, target);
+            if (npc.isSpawned() && !army.flights.containsKey(npc)) steerOne(owner, army, npc, target);
         }
     }
 
-    // runs every 0.5s
+    // runs every 0.25s
     private void tickArmy(Player owner, Army army) {
         if (!owner.isOnline() || owner.isDead()) {
             dismiss(owner.getUniqueId(), false);
             return;
         }
-        army.ticks += 10;
+        army.ticks += (int) TICK;
+
+        if (army.rally != null && !army.rally.getWorld().equals(owner.getWorld())) army.rally = null;
+        if (army.rally != null && army.ticks % 20 == 0) {
+            army.rally.getWorld().spawnParticle(Particle.PORTAL, army.rally.clone().add(0, 0.6, 0), 10, 0.4, 0.4, 0.4, 0.2);
+        }
 
         LivingEntity target = liveTarget(owner, army.targetId);
         if (army.targetId != null && target == null) {
-            command(owner, army, null);                 // target died / left: follow owner again
+            command(owner, army, null);                 // target died / left
         }
 
         for (NPC npc : army.npcs) {
             if (!npc.isSpawned()) continue;
+            if (army.flights.containsKey(npc)) continue;   // in the air: flightTick drives it
+
+            Location here = npc.getEntity().getLocation();
+            if (target != null && army.roles.get(npc) == Role.MACE
+                    && maybeLaunch(owner, army, npc, here, target)) {
+                continue;
+            }
+
             steerOne(owner, army, npc, target);
             if (target != null) {
-                pursue(owner, army, npc, npc.getEntity().getLocation(), target);
+                checkStuck(owner, army, npc, here, target.getLocation(), target, 9);
+            } else if (army.rally != null) {
+                int idx = Math.max(0, army.npcs.indexOf(npc));
+                checkStuck(owner, army, npc, here, slot(army, army.rally, idx, false), null, 4);
             } else {
                 army.stuck.remove(npc);
                 army.lastPos.remove(npc);
             }
         }
     }
+
+    // runs every 0.1s: keeps heads pointed at what the NULL is working on or fighting
+    private void lookTick(Player owner, Army army) {
+        if (army.dismissed) return;
+        long now = System.currentTimeMillis();
+        LivingEntity target = liveTarget(owner, army.targetId);
+
+        for (NPC npc : army.npcs) {
+            if (!npc.isSpawned() || army.flights.containsKey(npc)) continue;
+
+            Location focus = army.focus.get(npc);
+            Long until = army.busyUntil.get(npc);
+            if (focus != null && until != null && now < until) {
+                npc.faceLocation(focus);                          // looking at the block it is mining/placing
+                continue;
+            }
+            if (target != null && army.engaged.contains(npc) && army.roles.get(npc) != Role.ARCHER) {
+                Location here = npc.getEntity().getLocation();
+                if (here.getWorld().equals(target.getWorld())
+                        && here.distanceSquared(target.getLocation()) <= 64) {
+                    npc.faceLocation(target.getEyeLocation());    // eyes on the enemy while fighting
+                }
+            }
+        }
+    }
+
+    // ---------- elytra-mace flight ----------
+
+    // a far-away target: swap to elytra + mace and take off (true = it is now flying)
+    private boolean maybeLaunch(Player owner, Army army, NPC npc, Location here, LivingEntity target) {
+        if (!getConfig().getBoolean("army.mace-elytra", true)) return false;
+        long now = System.currentTimeMillis();
+        if (now < army.maceReady.getOrDefault(npc, 0L)) return false;
+        if (!here.getWorld().equals(target.getWorld())) return false;
+
+        double d = here.distance(target.getLocation());
+        if (d < MACE_LAUNCH_MIN || d > MACE_LAUNCH_MAX) return false;
+
+        // needs open sky above to take off
+        for (int i = 1; i <= 6; i++) {
+            if (!here.getBlock().getRelative(BlockFace.UP, i).isPassable()) {
+                army.maceReady.put(npc, now + 3000);
+                return false;
+            }
+        }
+
+        npc.getNavigator().cancelNavigation();
+        army.engaged.remove(npc);
+        army.lastDest.remove(npc);
+        army.stuck.remove(npc);
+        equipStyle(npc, true);
+
+        Flight f = new Flight();
+        f.apexY = here.getY();
+        army.flights.put(npc, f);
+        here.getWorld().playSound(here, Sound.ENTITY_FIREWORK_ROCKET_LAUNCH, 1f, 1f);
+        return true;
+    }
+
+    // runs every tick: moves every NULL that is in the air
+    private void flightTick(Player owner, Army army) {
+        if (army.dismissed || army.flights.isEmpty()) return;
+
+        double diveHeight = getConfig().getDouble("army.mace-dive-height", 14.0);
+
+        for (Map.Entry<NPC, Flight> entry : new ArrayList<>(army.flights.entrySet())) {
+            NPC npc = entry.getKey();
+            Flight f = entry.getValue();
+            if (!npc.isSpawned()) {
+                army.flights.remove(npc);
+                continue;
+            }
+
+            LivingEntity target = liveTarget(owner, army.targetId);
+            Entity ne = npc.getEntity();
+            Location cur = ne.getLocation();
+            f.ticks++;
+
+            if (target == null || f.ticks > MACE_FLIGHT_MAX_TICKS) {
+                endFlight(army, npc, null, false);
+                continue;
+            }
+
+            Location tl = target.getLocation().add(0, target.getHeight() * 0.5, 0);
+            Vector move;
+
+            if (f.phase == 0) {
+                // climb, drifting toward the target
+                if (cur.getY() >= tl.getY() + diveHeight || f.ticks > 25) f.phase = 1;
+                Vector horiz = tl.toVector().subtract(cur.toVector());
+                horiz.setY(0);
+                if (horiz.lengthSquared() > 0.01) horiz.normalize().multiply(0.35);
+                move = new Vector(horiz.getX(), 0.9, horiz.getZ());
+            } else {
+                Vector to = tl.toVector().subtract(cur.toVector());
+                double dist = to.length();
+                if (dist <= 1.8) {
+                    smash(owner, army, npc, target, f);
+                    continue;
+                }
+                double speed = Math.min(2.2, 0.9 + f.diveTicks * 0.12);
+                f.diveTicks++;
+                move = to.normalize().multiply(Math.min(speed, dist));
+            }
+
+            Location next = cur.clone().add(move);
+            next.setDirection(move);
+
+            // blocked by a wall or roof: crash-land without damage
+            if (!next.getBlock().isPassable() || !next.clone().add(0, 1, 0).getBlock().isPassable()) {
+                endFlight(army, npc, null, false);
+                continue;
+            }
+
+            f.apexY = Math.max(f.apexY, next.getY());
+            npc.teleport(next, PlayerTeleportEvent.TeleportCause.PLUGIN);
+            if (ne instanceof LivingEntity le) le.setGliding(true);
+            ne.setFallDistance(0f);
+            next.getWorld().spawnParticle(Particle.CLOUD, next, 2, 0.1, 0.1, 0.1, 0.01);
+        }
+    }
+
+    // the dive hit: mace smash damage grows with the height fallen
+    private void smash(Player owner, Army army, NPC npc, LivingEntity target, Flight f) {
+        Entity attacker = npc.getEntity();
+        Location at = target.getLocation();
+
+        double fall = Math.max(0, f.apexY - at.getY());
+        double bonus = Math.min(fall, 3) * 4
+                + Math.min(Math.max(fall - 3, 0), 5) * 2
+                + Math.max(fall - 8, 0);
+        double density = 0.5 * 5 * fall;                       // Density V
+        double max = getConfig().getDouble("army.mace-max-damage", 40.0);
+        double dmg = Math.min(max, 6 + bonus + density);
+
+        target.damage(dmg, attacker);
+        target.setVelocity(target.getVelocity().add(new Vector(0, 0.7, 0)));
+
+        for (Entity near : at.getWorld().getNearbyEntities(at, 3.5, 3.5, 3.5)) {
+            if (near.equals(target) || !canTarget(owner, near)) continue;
+            ((LivingEntity) near).damage(dmg * 0.35, attacker);
+            near.setVelocity(near.getVelocity().add(new Vector(0, 0.5, 0)));
+        }
+
+        World w = at.getWorld();
+        w.playSound(at, Sound.ITEM_MACE_SMASH_GROUND, 1.2f, 1f);
+        w.spawnParticle(Particle.CLOUD, at.clone().add(0, 0.3, 0), 40, 1.0, 0.2, 1.0, 0.1);
+        w.spawnParticle(Particle.CRIT, at.clone().add(0, 1, 0), 30, 0.6, 0.6, 0.6, 0.3);
+
+        endFlight(army, npc, at, true);
+    }
+
+    private Location groundBelow(Location from) {
+        Location l = from.clone();
+        for (int i = 0; i < 12; i++) {
+            if (l.getBlock().getRelative(BlockFace.DOWN).getType().isSolid()) return l;
+            l.subtract(0, 1, 0);
+        }
+        return from.clone();
+    }
+
+    // landed (or crashed): back on the ground, switch back to the normal style
+    private void endFlight(Army army, NPC npc, Location landAt, boolean smashed) {
+        army.flights.remove(npc);
+        if (!npc.isSpawned()) return;
+
+        Entity ne = npc.getEntity();
+        if (ne instanceof LivingEntity le) le.setGliding(false);
+        ne.setFallDistance(0f);
+
+        if (landAt != null) {
+            Location land = groundBelow(landAt).add(1, 0, 0);
+            if (!land.getBlock().isPassable()) land.subtract(1, 0, 0);
+            npc.teleport(land, PlayerTeleportEvent.TeleportCause.PLUGIN);
+        }
+
+        long cooldownMs = smashed
+                ? (long) (getConfig().getDouble("army.mace-cooldown-seconds", 10.0) * 1000)
+                : 4000L;
+        army.maceReady.put(npc, System.currentTimeMillis() + cooldownMs);
+        army.lastDest.remove(npc);
+        army.engaged.remove(npc);
+
+        Bukkit.getScheduler().runTaskLater(this, () -> {
+            if (!army.dismissed && npc.isSpawned() && !army.flights.containsKey(npc)) equipStyle(npc, false);
+        }, 8L);
+    }
+
+    // ---------- walking, fighting, building ----------
 
     // decides where one NPC should be heading
     private void steerOne(Player owner, Army army, NPC npc, LivingEntity target) {
@@ -785,7 +1143,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
 
         if (target != null) {
             Location tl = target.getLocation();
-            if (!here.getWorld().equals(tl.getWorld())) return;   // pursue() teleports it over
+            if (!here.getWorld().equals(tl.getWorld())) return;   // checkStuck() teleports it over
             double d = here.distance(tl);
 
             if (role == Role.ARCHER) {
@@ -813,14 +1171,15 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
             return;
         }
 
-        // no target: follow the owner
-        Location o = owner.getLocation();
-        if (!here.getWorld().equals(o.getWorld()) || here.distanceSquared(o) > 40 * 40) {
-            npc.teleport(slot(army, o, index, false), PlayerTeleportEvent.TeleportCause.PLUGIN);
+        // no target: hold the rally point, or follow the owner
+        Location center = army.rally != null ? army.rally : owner.getLocation();
+        if (!here.getWorld().equals(center.getWorld())
+                || (army.rally == null && here.distanceSquared(center) > 40 * 40)) {
+            npc.teleport(slot(army, center, index, false), PlayerTeleportEvent.TeleportCause.PLUGIN);
             army.lastDest.remove(npc);
             return;
         }
-        walkTo(army, npc, nav, here, slot(army, o, index, false));
+        walkTo(army, npc, nav, here, slot(army, center, index, false));
     }
 
     // archers stop at range and shoot instead of running into melee
@@ -852,6 +1211,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         dir.normalize();
         dir.setY(dir.getY() + dist * 0.012);          // small arc compensation
 
+        me.swingMainHand();
         Arrow arrow = me.getWorld().spawnArrow(eye, dir, 3.0f, 1.0f, Arrow.class);
         arrow.setShooter(me);
         arrow.setCritical(true);
@@ -872,10 +1232,12 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         }
     }
 
-    private void pursue(Player owner, Army army, NPC npc, Location here, LivingEntity target) {
-        Location to = target.getLocation();
+    // is this NPC stuck on its way to <to>? if so, start digging / bridging / pillaring
+    private void checkStuck(Player owner, Army army, NPC npc, Location here, Location to,
+                            LivingEntity target, double nearSq) {
         if (!here.getWorld().equals(to.getWorld())) {
-            npc.teleport(slot(army, owner.getLocation(), Math.max(0, army.npcs.indexOf(npc)), false),
+            Location c = army.rally != null ? army.rally : owner.getLocation();
+            npc.teleport(slot(army, c, Math.max(0, army.npcs.indexOf(npc)), false),
                     PlayerTeleportEvent.TeleportCause.PLUGIN);
             army.lastDest.remove(npc);
             return;
@@ -884,29 +1246,28 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         Location last = army.lastPos.put(npc, here.clone());
 
         // an archer standing still and shooting is not stuck
-        if (army.roles.get(npc) == Role.ARCHER && npc.getEntity() instanceof LivingEntity me
+        if (target != null && army.roles.get(npc) == Role.ARCHER && npc.getEntity() instanceof LivingEntity me
                 && here.distanceSquared(to) <= ARCHER_RANGE * ARCHER_RANGE && me.hasLineOfSight(target)) {
             army.stuck.put(npc, 0);
             return;
         }
-        if (here.distanceSquared(to) <= 9) {          // close enough: it is fighting
+        if (here.distanceSquared(to) <= nearSq) {     // close enough: fighting or arrived
             army.stuck.put(npc, 0);
             return;
         }
         boolean moved = last != null && last.getWorld().equals(here.getWorld())
-                && last.distanceSquared(here) > 0.09;
+                && last.distanceSquared(here) > 0.04;
         if (moved) {
             army.stuck.put(npc, 0);
             return;
         }
         int stuckFor = army.stuck.merge(npc, 1, Integer::sum);
-        if (stuckFor < 2) return;                     // stuck for about 1 second
-        army.stuck.put(npc, 0);
+        if (stuckFor < 2) return;                     // no movement for about half a second
 
-        clearPath(owner, army, npc, here, to);
+        clearPath(owner, army, npc, here, to);        // keeps working every check while still blocked
     }
 
-    // stuck NPC: dig through, bridge, pillar up or dig down
+    // blocked NPC: dig a tunnel, bridge a gap, pillar up or dig down (fast)
     private void clearPath(Player owner, Army army, NPC npc, Location here, Location to) {
         boolean breakOn = getConfig().getBoolean("army.break-blocks", true);
         boolean placeOn = getConfig().getBoolean("army.place-blocks", true);
@@ -921,22 +1282,37 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         Block feet = here.getBlock();
         Block front = feet.getRelative(face);
         Block frontHead = front.getRelative(BlockFace.UP);
+        Block front2 = front.getRelative(face);
+        Block front2Head = front2.getRelative(BlockFace.UP);
 
-        // 1) wall ahead: dig through
-        if (!front.isPassable() || !frontHead.isPassable()) {
+        // 1) wall ahead: dig a two-block-deep tunnel in one go
+        if (!front.isPassable() || !frontHead.isPassable() || !front2.isPassable() || !front2Head.isPassable()) {
             if (breakOn) {
-                boolean didHead = breakBlock(owner, frontHead);
-                boolean didFeet = breakBlock(owner, front);
-                if (didHead || didFeet) return;
+                boolean did = false;
+                boolean makeSound = true;
+                for (Block b : new Block[]{frontHead, front, front2Head, front2}) {
+                    if (b.isPassable()) continue;
+                    if (breakBlock(owner, b, makeSound)) {
+                        did = true;
+                        makeSound = false;
+                    }
+                }
+                if (did) {
+                    showWork(army, npc, front);
+                    return;
+                }
             }
             if (dy >= 1.5 && placeOn) pillar(owner, army, npc, here, breakOn);
             return;
         }
 
-        // 2) gap ahead: bridge
+        // 2) gap ahead: bridge two blocks at once
         Block groundFront = front.getRelative(BlockFace.DOWN);
         if (placeOn && dy > -2 && !groundFront.getType().isSolid()) {
-            placeBlock(army, groundFront);
+            boolean did = placeBlock(army, groundFront);
+            Block groundFront2 = front2.getRelative(BlockFace.DOWN);
+            if (!groundFront2.getType().isSolid()) did |= placeBlock(army, groundFront2);
+            if (did) showWork(army, npc, groundFront);
             return;
         }
 
@@ -948,7 +1324,19 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
 
         // 4) target is far below: dig down
         if (dy <= -2.5 && breakOn) {
-            breakBlock(owner, feet.getRelative(BlockFace.DOWN));
+            Block below = feet.getRelative(BlockFace.DOWN);
+            if (breakBlock(owner, below, true)) showWork(army, npc, below);
+        }
+    }
+
+    // arm swing + eyes on the block it is working on
+    private void showWork(Army army, NPC npc, Block focus) {
+        Location f = focus.getLocation().add(0.5, 0.5, 0.5);
+        army.focus.put(npc, f);
+        army.busyUntil.put(npc, System.currentTimeMillis() + 700);
+        if (npc.isSpawned()) {
+            npc.faceLocation(f);
+            if (npc.getEntity() instanceof LivingEntity le) le.swingMainHand();
         }
     }
 
@@ -956,14 +1344,15 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         Block feet = here.getBlock();
         Block above2 = feet.getRelative(BlockFace.UP, 2);
         if (!above2.isPassable()) {
-            if (!breakOn || !breakBlock(owner, above2)) return;
+            if (!breakOn || !breakBlock(owner, above2, true)) return;
         }
         if (placeBlock(army, feet)) {
             npc.teleport(here.clone().add(0, 1, 0), PlayerTeleportEvent.TeleportCause.PLUGIN);
+            showWork(army, npc, feet);
         }
     }
 
-    private boolean breakBlock(Player owner, Block b) {
+    private boolean breakBlock(Player owner, Block b, boolean makeSound) {
         Material t = b.getType();
         if (t.isAir() || b.isLiquid() || t.getHardness() < 0) return false;
         if (t == Material.SPAWNER || t == Material.BEACON) return false;
@@ -974,8 +1363,10 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         Bukkit.getPluginManager().callEvent(ev);
         if (ev.isCancelled()) return false;
 
-        Sound sound = b.getBlockData().getSoundGroup().getBreakSound();
-        b.getWorld().playSound(b.getLocation(), sound, 1f, 0.8f);
+        if (makeSound) {
+            Sound sound = b.getBlockData().getSoundGroup().getBreakSound();
+            b.getWorld().playSound(b.getLocation(), sound, 1f, 0.8f);
+        }
         b.setType(Material.AIR);
         return true;
     }
@@ -1001,6 +1392,8 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         army.dismissed = true;
         if (army.task != null) army.task.cancel();
         if (army.spawnTask != null) army.spawnTask.cancel();
+        if (army.lookTask != null) army.lookTask.cancel();
+        if (army.flightTask != null) army.flightTask.cancel();
 
         Location where = null;
         for (NPC npc : army.npcs) {
@@ -1030,4 +1423,4 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
     public void onDeath(PlayerDeathEvent e) {
         dismiss(e.getPlayer().getUniqueId(), false);
     }
-    }
+                                          }
