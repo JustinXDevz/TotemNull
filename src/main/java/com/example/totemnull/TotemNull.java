@@ -106,6 +106,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
     private static final int MACE_FLIGHT_MAX_TICKS = 80;
     private static final int JOB_MAX_TICKS = 20 * 40;    // an order is dropped after 40 seconds
     private static final int BRIDGE_BLOCKS_PER_STEP = 6; // blocks placed every 2 ticks while bridging
+    private static final double HOME_TELEPORT_DIST = 150; // NULL farther than this from home pop back to it
 
     private enum Formation { RING, CHARGE, SCATTER }
 
@@ -147,6 +148,24 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         }
     }
 
+    // /nulltarget: the army goes through a portal and kills one player, however far away
+    private static class Mission {
+        final UUID target;
+        final Set<NPC> members = new HashSet<>();
+        final Set<NPC> arrived = new HashSet<>();
+        final List<NPC> queue = new ArrayList<>();
+        Portal departure;
+        Portal arrival;
+        Location departAt;
+        Location arriveAt;
+        int phase = 0;      // 0 = gathering at the departure portal, 1 = going through, 2 = everyone is through
+        int ticks = 0;
+
+        Mission(UUID target) {
+            this.target = target;
+        }
+    }
+
     // area where fire does not hurt the commander or their NULL
     private static class BurnZone {
         final UUID owner;
@@ -176,13 +195,14 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         final Map<NPC, Flight> flights = new HashMap<>();   // elytra-mace NULL that are in the air
         final Map<NPC, Long> maceReady = new HashMap<>();   // when a mace NULL may take off again
         final Set<NPC> engaged = new HashSet<>();
-        final Set<NPC> busy = new HashSet<>();              // NULL carrying out an order
+        final Set<NPC> busy = new HashSet<>();              // NULL carrying out an order or travelling
         final List<Job> jobs = new ArrayList<>();
         final List<Block> placed = new ArrayList<>();
         final List<Portal> portals = new ArrayList<>();
         Material placedType = Material.COBBLESTONE;
         Formation formation = Formation.RING;
         Location rally;      // null = follow the owner
+        Mission mission;     // /nulltarget in progress
         boolean captain = true;
         boolean dismissed = false;
         boolean hunting = false;   // hunt mode: kill everything (except allies) near the owner
@@ -230,6 +250,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         getCommand("nullform").setExecutor(this);
         getCommand("nullhunt").setExecutor(this);
         getCommand("nullally").setExecutor(this);
+        getCommand("nulltarget").setExecutor(this);
     }
 
     @Override
@@ -362,6 +383,16 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         if (cmd.getName().equalsIgnoreCase("nullally")) {
             if (sender instanceof Player ap) {
                 handleAlly(ap, args);
+            } else {
+                sender.sendMessage("Players only.");
+            }
+            return true;
+        }
+
+        // /nulltarget <player|cancel>
+        if (cmd.getName().equalsIgnoreCase("nulltarget")) {
+            if (sender instanceof Player tp) {
+                handleNullTarget(tp, args);
             } else {
                 sender.sendMessage("Players only.");
             }
@@ -751,14 +782,217 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         return liveTarget(owner, id);
     }
 
-    // what this NULL is after right now: its own hunt target (hunt mode), else the army's target
+    // what this NULL is after right now: the /nulltarget player (once through the portal),
+    // its own hunt target (hunt mode), else the army's target
     private LivingEntity targetFor(Player owner, Army army, NPC npc) {
+        Mission m = army.mission;
+        if (m != null && m.arrived.contains(npc)) {
+            Player t = missionTarget(owner, m);
+            if (t != null) return t;
+        }
         if (army.hunting) {
             UUID id = army.huntTarget.get(npc);
             LivingEntity t = id == null ? null : liveTarget(owner, id);
             if (t != null) return t;
         }
         return liveTarget(owner, army.targetId);
+    }
+
+    // ---------- /nulltarget ----------
+
+    private void handleNullTarget(Player owner, String[] args) {
+        Army army = armies.get(owner.getUniqueId());
+        if (army == null || !hasTotem(owner)) {
+            owner.sendMessage(Component.text("Blow the Call horn first (and carry the Totem of NULL).", NamedTextColor.RED));
+            return;
+        }
+        if (args.length == 0) {
+            owner.sendMessage(Component.text("Use: /nulltarget <player>  or  /nulltarget cancel", NamedTextColor.GRAY));
+            return;
+        }
+        if (args[0].equalsIgnoreCase("cancel")) {
+            if (army.mission == null) {
+                owner.sendMessage(Component.text("No mission is running.", NamedTextColor.GRAY));
+            } else {
+                endMission(army, "NULL: mission cancelled.", owner);
+            }
+            return;
+        }
+
+        Player target = Bukkit.getPlayerExact(args[0]);
+        if (target == null) target = Bukkit.getPlayer(args[0]);
+        if (target == null) {
+            owner.sendMessage(Component.text("That player is not online.", NamedTextColor.RED));
+            return;
+        }
+        if (target.equals(owner) || isAlly(owner, target) || isNpc(target)) {
+            owner.sendMessage(Component.text("NULL will not hunt " + target.getName() + ".", NamedTextColor.RED));
+            return;
+        }
+        if (!target.getWorld().equals(owner.getWorld())) {
+            owner.sendMessage(Component.text(target.getName() + " is in another world.", NamedTextColor.RED));
+            return;
+        }
+        startMission(owner, army, target);
+    }
+
+    // the player a mission is after (null = gone, dead, or in another world)
+    private Player missionTarget(Player owner, Mission m) {
+        Player p = Bukkit.getPlayer(m.target);
+        if (p == null || !p.isOnline() || p.isDead() || !p.getWorld().equals(owner.getWorld())) return null;
+        return p;
+    }
+
+    private void trackPortal(Army army, Portal p) {
+        army.portals.add(p);
+        activePortals.add(p);
+        p.center.getWorld().playSound(p.center, Sound.BLOCK_PORTAL_TRIGGER, 0.6f, 1.2f);
+        p.center.getWorld().spawnParticle(Particle.PORTAL, p.center.clone().add(0, 1, 0), 60, 0.6, 1.0, 0.6, 0.4);
+    }
+
+    private void startMission(Player owner, Army army, Player target) {
+        if (army.mission != null) endMission(army, null, owner);
+
+        Mission m = new Mission(target.getUniqueId());
+        for (NPC n : army.npcs) {
+            if (n.isSpawned() && !army.flights.containsKey(n) && !army.busy.contains(n)) m.members.add(n);
+        }
+        if (m.members.isEmpty()) {
+            owner.sendActionBar(Component.text("No free NULL.", NamedTextColor.RED));
+            return;
+        }
+
+        boolean portals = getConfig().getBoolean("army.portals", true)
+                && getConfig().getBoolean("army.nulltarget-portal", true);
+        double dist = getConfig().getDouble("army.nulltarget-arrival-distance", 16.0);
+        Location tl = target.getLocation();
+
+        // one portal here, one portal near the target
+        m.departure = portals ? openPortal(owner, owner.getLocation(), PORTAL_MIN_DIST, PORTAL_MAX_DIST) : null;
+        m.arrival = portals ? openPortal(owner, tl, dist, dist + 4) : null;
+        if (m.departure != null) trackPortal(army, m.departure);
+        if (m.arrival != null) trackPortal(army, m.arrival);
+
+        m.departAt = m.departure != null ? m.departure.center.clone() : owner.getLocation();
+        m.arriveAt = m.arrival != null ? m.arrival.center.clone() : pickArrivalSpot(tl, dist);
+
+        army.busy.addAll(m.members);
+        army.mission = m;
+        owner.sendActionBar(Component.text("NULL: hunting " + target.getName(), NamedTextColor.DARK_RED));
+        owner.getWorld().playSound(owner.getLocation(), Sound.ENTITY_WITHER_AMBIENT, 0.8f, 0.6f);
+    }
+
+    private void endMission(Army army, String message, Player owner) {
+        Mission m = army.mission;
+        if (m == null) return;
+        army.mission = null;
+        army.busy.removeAll(m.members);
+        if (m.departure != null) closePortal(m.departure);
+        if (m.arrival != null) closePortal(m.arrival);
+        army.lastDest.clear();
+        army.engaged.clear();
+        if (message != null && owner != null) {
+            owner.sendActionBar(Component.text(message, NamedTextColor.DARK_RED));
+        }
+    }
+
+    // a ground spot about <dist> blocks from the target (used when no portal could be built there)
+    private Location pickArrivalSpot(Location target, double dist) {
+        ThreadLocalRandom r = ThreadLocalRandom.current();
+        World w = target.getWorld();
+        for (int i = 0; i < 16; i++) {
+            double angle = r.nextDouble(Math.PI * 2);
+            int x = target.getBlockX() + (int) Math.round(Math.cos(angle) * dist);
+            int z = target.getBlockZ() + (int) Math.round(Math.sin(angle) * dist);
+            if (!w.isChunkLoaded(x >> 4, z >> 4)) continue;
+            int y = findGround(w, x, target.getBlockY(), z);
+            if (y != Integer.MIN_VALUE) return new Location(w, x + 0.5, y, z + 0.5);
+        }
+        return target.clone().add(3, 0, 0);
+    }
+
+    // a spot a NULL can safely stand in (falls back to <fallback>)
+    private Location safeSpot(Location l, Location fallback) {
+        if (l.getBlock().isPassable() && l.clone().add(0, 1, 0).getBlock().isPassable()) return l;
+        return fallback.clone();
+    }
+
+    // runs every 0.25s while a mission is on
+    private void missionTick(Player owner, Army army) {
+        Mission m = army.mission;
+        if (m == null) return;
+
+        Player target = missionTarget(owner, m);
+        if (target == null) {
+            Player p = Bukkit.getPlayer(m.target);
+            boolean dead = p != null && p.isOnline() && p.isDead();
+            endMission(army, dead ? "NULL: target eliminated." : "NULL: target is gone.", owner);
+            return;
+        }
+        m.ticks += (int) TICK;
+
+        // 0) everyone walks to the portal here
+        if (m.phase == 0) {
+            boolean allThere = true;
+            for (NPC npc : m.members) {
+                if (!npc.isSpawned()) continue;
+                Location here = npc.getEntity().getLocation();
+                if (!here.getWorld().equals(m.departAt.getWorld()) || here.distanceSquared(m.departAt) > 16) {
+                    allThere = false;
+                    walkTo(army, npc, npc.getNavigator(), here, m.departAt);
+                }
+            }
+            if (allThere || m.ticks > 160) {
+                m.phase = 1;
+                for (NPC n : m.members) {
+                    if (n.isSpawned()) m.queue.add(n);
+                }
+            }
+            return;
+        }
+
+        // 1) they step through, two at a time
+        if (m.phase == 1) {
+            for (int i = 0; i < 2 && !m.queue.isEmpty(); i++) {
+                NPC npc = m.queue.remove(0);
+                if (!npc.isSpawned()) {
+                    army.busy.remove(npc);
+                    continue;
+                }
+                sendThrough(army, m, npc);
+            }
+            if (m.queue.isEmpty()) {
+                m.phase = 2;
+                Bukkit.getScheduler().runTaskLater(this, () -> {
+                    if (m.departure != null) closePortal(m.departure);
+                    if (m.arrival != null) closePortal(m.arrival);
+                }, 60L);
+            }
+        }
+    }
+
+    // one NULL steps into the portal here and comes out of the one near the target
+    private void sendThrough(Army army, Mission m, NPC npc) {
+        Location from = npc.getEntity().getLocation();
+        int idx = Math.max(0, army.npcs.indexOf(npc));
+        Location spot = safeSpot(slot(army, m.arriveAt, idx, false), m.arriveAt);
+
+        from.getWorld().spawnParticle(Particle.PORTAL, from.clone().add(0, 1, 0), 30, 0.3, 0.6, 0.3, 0.3);
+        from.getWorld().playSound(from, Sound.ENTITY_ENDERMAN_TELEPORT, 0.6f, 0.8f);
+
+        npc.getNavigator().cancelNavigation();
+        npc.teleport(spot, PlayerTeleportEvent.TeleportCause.PLUGIN);
+
+        spot.getWorld().spawnParticle(Particle.PORTAL, spot.clone().add(0, 1, 0), 30, 0.3, 0.6, 0.3, 0.3);
+        spot.getWorld().playSound(spot, Sound.ENTITY_ENDERMAN_TELEPORT, 0.6f, 1.2f);
+
+        army.busy.remove(npc);
+        m.arrived.add(npc);
+        army.lastDest.remove(npc);
+        army.engaged.remove(npc);
+        army.stuck.remove(npc);
+        army.idle.remove(npc);
+        army.lastPos.remove(npc);
     }
 
     // ---------- hunt mode ----------
@@ -993,23 +1227,22 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         return !ev.isCancelled() && ev.canBuild();
     }
 
-    // builds a 4x5 portal (obsidian frame, 2x3 portal inside) at a random spot near the owner
-    private Portal openPortal(Player owner) {
+    // builds a 4x5 portal (obsidian frame, 2x3 portal inside) at a random spot between minDist and maxDist from <around>
+    private Portal openPortal(Player owner, Location around, double minDist, double maxDist) {
         ThreadLocalRandom r = ThreadLocalRandom.current();
-        Location o = owner.getLocation();
-        World w = o.getWorld();
+        World w = around.getWorld();
 
         for (int attempt = 0; attempt < 12; attempt++) {
             double angle = r.nextDouble(Math.PI * 2);
-            double dist = r.nextDouble(PORTAL_MIN_DIST, PORTAL_MAX_DIST);
-            int bx = o.getBlockX() + (int) Math.round(Math.cos(angle) * dist);
-            int bz = o.getBlockZ() + (int) Math.round(Math.sin(angle) * dist);
+            double dist = r.nextDouble(minDist, maxDist);
+            int bx = around.getBlockX() + (int) Math.round(Math.cos(angle) * dist);
+            int bz = around.getBlockZ() + (int) Math.round(Math.sin(angle) * dist);
             boolean axisX = r.nextBoolean();
             int dx = axisX ? 1 : 0;
             int dz = axisX ? 0 : 1;
 
             if (!w.isChunkLoaded(bx >> 4, bz >> 4) || !w.isChunkLoaded((bx + 3 * dx) >> 4, (bz + 3 * dz) >> 4)) continue;
-            int by = findGround(w, bx, o.getBlockY(), bz);
+            int by = findGround(w, bx, around.getBlockY(), bz);
             if (by == Integer.MIN_VALUE) continue;
             if (by < w.getMinHeight() + 1 || by + 5 >= w.getMaxHeight()) continue;
 
@@ -1152,13 +1385,10 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
     private void enter(Player owner, Army army, int forcedIndex, boolean initial) {
         if (initial) army.pending++;
 
-        final Portal portal = getConfig().getBoolean("army.portals", true) ? openPortal(owner) : null;
+        final Portal portal = getConfig().getBoolean("army.portals", true)
+                ? openPortal(owner, owner.getLocation(), PORTAL_MIN_DIST, PORTAL_MAX_DIST) : null;
         if (portal != null) {
-            army.portals.add(portal);
-            activePortals.add(portal);
-            World w = portal.center.getWorld();
-            w.playSound(portal.center, Sound.BLOCK_PORTAL_TRIGGER, 0.5f, 1.4f);
-            w.spawnParticle(Particle.PORTAL, portal.center.clone().add(0, 1, 0), 60, 0.6, 1.0, 0.6, 0.4);
+            trackPortal(army, portal);
         }
 
         long delay = portal != null ? PORTAL_OPEN_TICKS : 1L;
@@ -1271,6 +1501,11 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         army.flights.remove(dead);
         army.maceReady.remove(dead);
         army.busy.remove(dead);
+        if (army.mission != null) {
+            army.mission.members.remove(dead);
+            army.mission.arrived.remove(dead);
+            army.mission.queue.remove(dead);
+        }
 
         if (index >= 0) queueReplacement(owner, army, index);
     }
@@ -1316,6 +1551,8 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
             command(owner, army, null);                 // target died / left
         }
 
+        missionTick(owner, army);                       // /nulltarget: gather, go through the portal, hunt
+
         // hunt mode: look around the owner once, then every NULL picks its own prey
         List<LivingEntity> huntables = army.hunting ? scanHuntables(owner) : null;
         if (army.hunting && army.ticks % 20 == 0) {
@@ -1328,11 +1565,13 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         for (NPC npc : army.npcs) {
             if (!npc.isSpawned()) continue;
             if (army.flights.containsKey(npc)) continue;   // in the air: flightTick drives it
-            if (army.busy.contains(npc)) continue;         // carrying out an order: jobTick drives it
+            if (army.busy.contains(npc)) continue;         // carrying out an order / travelling
 
-            LivingEntity target = army.hunting
-                    ? assignHunt(owner, army, npc, huntables, armyTarget)
-                    : armyTarget;
+            // the /nulltarget player beats everything else for NULL that came through the portal
+            LivingEntity missionT = army.mission != null && army.mission.arrived.contains(npc)
+                    ? missionTarget(owner, army.mission) : null;
+            LivingEntity target = missionT != null ? missionT
+                    : (army.hunting ? assignHunt(owner, army, npc, huntables, armyTarget) : armyTarget);
 
             Location here = npc.getEntity().getLocation();
             if (target != null && army.roles.get(npc) == Role.MACE
@@ -1935,10 +2174,15 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
             return;
         }
 
-        // no target: hold the rally point, or follow the owner
+        // no target: hold the rally point, or follow the owner (far from home = pop back to it)
         Location center = army.rally != null ? army.rally : owner.getLocation();
-        if (!here.getWorld().equals(center.getWorld())
-                || (army.rally == null && here.distanceSquared(center) > 40 * 40)) {
+        if (!here.getWorld().equals(center.getWorld())) {
+            npc.teleport(slot(army, center, index, false), PlayerTeleportEvent.TeleportCause.PLUGIN);
+            army.lastDest.remove(npc);
+            return;
+        }
+        double home = here.distanceSquared(center);
+        if ((army.rally == null && home > 40 * 40) || home > HOME_TELEPORT_DIST * HOME_TELEPORT_DIST) {
             npc.teleport(slot(army, center, index, false), PlayerTeleportEvent.TeleportCause.PLUGIN);
             army.lastDest.remove(npc);
             return;
@@ -2069,192 +2313,4 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         Location from = npc.getEntity().getLocation();
         from.getWorld().spawnParticle(Particle.PORTAL, from.clone().add(0, 1, 0), 30, 0.3, 0.6, 0.3, 0.2);
         npc.teleport(spot, PlayerTeleportEvent.TeleportCause.PLUGIN);
-        spot.getWorld().spawnParticle(Particle.PORTAL, spot.clone().add(0, 1, 0), 30, 0.3, 0.6, 0.3, 0.2);
-        army.lastDest.remove(npc);
-        army.engaged.remove(npc);
-    }
-
-    // blocked NPC: dig a tunnel, bridge a gap, stack blocks up or dig down. true = it did something
-    private boolean clearPath(Player owner, Army army, NPC npc, Location here, Location to, LivingEntity target) {
-        boolean breakOn = getConfig().getBoolean("army.break-blocks", true);
-        boolean placeOn = getConfig().getBoolean("army.place-blocks", true);
-
-        double dx = to.getX() - here.getX();
-        double dz = to.getZ() - here.getZ();
-        double dy = to.getY() - here.getY();
-        boolean xFirst = Math.abs(dx) > Math.abs(dz);
-        BlockFace primary = xFirst ? (dx > 0 ? BlockFace.EAST : BlockFace.WEST)
-                                   : (dz > 0 ? BlockFace.SOUTH : BlockFace.NORTH);
-        BlockFace secondary = xFirst ? (dz > 0 ? BlockFace.SOUTH : BlockFace.NORTH)
-                                     : (dx > 0 ? BlockFace.EAST : BlockFace.WEST);
-        boolean useSecondary = Math.min(Math.abs(dx), Math.abs(dz)) >= 1.5;
-
-        Block feet = here.getBlock();
-        boolean canClimb = target != null
-                ? shouldClimb(here, target)
-                : (dy >= 1.5 && dy <= getConfig().getDouble("army.pillar-max-height", 30.0));
-
-        // 1) wall ahead: dig a two-block-deep tunnel; if that side can't be dug, try the other direction
-        BlockFace[] tries = useSecondary ? new BlockFace[]{primary, secondary} : new BlockFace[]{primary};
-        boolean walled = false;
-        for (BlockFace face : tries) {
-            Block front = feet.getRelative(face);
-            Block frontHead = front.getRelative(BlockFace.UP);
-            Block front2 = front.getRelative(face);
-            Block front2Head = front2.getRelative(BlockFace.UP);
-            boolean wall = !front.isPassable() || !frontHead.isPassable()
-                    || !front2.isPassable() || !front2Head.isPassable();
-            if (!wall) continue;
-            walled = true;
-            if (breakOn && dig(owner, army, npc, front, frontHead, front2, front2Head)) return true;
-        }
-        if (walled) {
-            // could not dig through: go up and over if the target is above
-            return canClimb && placeOn && pillar(owner, army, npc, here, breakOn);
-        }
-
-        // 2) gap ahead: bridge two blocks at once
-        Block front = feet.getRelative(primary);
-        Block front2 = front.getRelative(primary);
-        Block groundFront = front.getRelative(BlockFace.DOWN);
-        if (placeOn && dy > -2 && !groundFront.getType().isSolid()) {
-            boolean did = placeBlock(army, groundFront);
-            Block groundFront2 = front2.getRelative(BlockFace.DOWN);
-            if (!groundFront2.getType().isSolid()) did |= placeBlock(army, groundFront2);
-            if (did) showWork(army, npc, groundFront);
-            return did;
-        }
-
-        // 3) target is above and reachable by stacking blocks
-        if (canClimb && placeOn) {
-            return pillar(owner, army, npc, here, breakOn);
-        }
-
-        // 4) target is far below: dig down
-        if (dy <= -2.5 && breakOn) {
-            Block below = feet.getRelative(BlockFace.DOWN);
-            if (breakBlock(owner, below, true)) {
-                showWork(army, npc, below);
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private boolean dig(Player owner, Army army, NPC npc, Block front, Block frontHead, Block front2, Block front2Head) {
-        boolean did = false;
-        boolean makeSound = true;
-        for (Block b : new Block[]{frontHead, front, front2Head, front2}) {
-            if (b.isPassable()) continue;
-            if (breakBlock(owner, b, makeSound)) {
-                did = true;
-                makeSound = false;
-            }
-        }
-        if (did) showWork(army, npc, front);
-        return did;
-    }
-
-    // arm swing + eyes on the block it is working on
-    private void showWork(Army army, NPC npc, Block focus) {
-        Location f = focus.getLocation().add(0.5, 0.5, 0.5);
-        army.focus.put(npc, f);
-        army.busyUntil.put(npc, System.currentTimeMillis() + 700);
-        if (npc.isSpawned()) {
-            npc.faceLocation(f);
-            if (npc.getEntity() instanceof LivingEntity le) le.swingMainHand();
-        }
-    }
-
-    // places a block under the NULL and lifts it one block up (true = it went up)
-    private boolean pillar(Player owner, Army army, NPC npc, Location here, boolean breakOn) {
-        Block feet = here.getBlock();
-        Block above2 = feet.getRelative(BlockFace.UP, 2);
-        if (!above2.isPassable()) {
-            if (!breakOn || !breakBlock(owner, above2, true)) return false;
-        }
-        if (!placeBlock(army, feet)) return false;
-
-        npc.teleport(here.clone().add(0, 1, 0), PlayerTeleportEvent.TeleportCause.PLUGIN);
-        army.climbUntil.put(npc, System.currentTimeMillis() + 700);   // keep going on the next check
-        showWork(army, npc, feet);
-        return true;
-    }
-
-    private boolean breakBlock(Player owner, Block b, boolean makeSound) {
-        Material t = b.getType();
-        if (t.isAir() || b.isLiquid() || t.getHardness() < 0) return false;
-        if (t == Material.SPAWNER || t == Material.BEACON) return false;
-        if (b.getState(false) instanceof Container) return false;
-
-        BlockBreakEvent ev = new BlockBreakEvent(b, owner); // lets protection plugins say no
-        ev.setDropItems(false);
-        Bukkit.getPluginManager().callEvent(ev);
-        if (ev.isCancelled()) return false;
-
-        if (makeSound) {
-            Sound sound = b.getBlockData().getSoundGroup().getBreakSound();
-            b.getWorld().playSound(b.getLocation(), sound, 1f, 0.8f);
-        }
-        b.setType(Material.AIR);
-        return true;
-    }
-
-    private boolean placeBlock(Army army, Block b) {
-        int cap = getConfig().getInt("army.max-placed-blocks", 1500);
-        if (army.placed.size() >= cap) return false;
-
-        Material cur = b.getType();
-        boolean soft = b.isPassable() && !cur.isAir() && cur.getHardness() <= 0.2f; // grass, flowers, snow layers
-        if (!(cur.isAir() || b.isLiquid() || soft)) return false;
-
-        Material m = Material.matchMaterial(getConfig().getString("army.place-block", "COBBLESTONE"));
-        if (m == null || !m.isBlock() || m.isAir()) m = Material.COBBLESTONE;
-
-        b.setType(m);
-        army.placedType = m;
-        army.placed.add(b);
-        Sound sound = b.getBlockData().getSoundGroup().getPlaceSound();
-        b.getWorld().playSound(b.getLocation(), sound, 1f, 1f);
-        return true;
-    }
-
-    private void dismiss(UUID ownerId, boolean sound) {
-        Army army = armies.remove(ownerId);
-        if (army == null) return;
-        army.dismissed = true;
-        if (army.task != null) army.task.cancel();
-        if (army.spawnTask != null) army.spawnTask.cancel();
-        if (army.lookTask != null) army.lookTask.cancel();
-        if (army.flightTask != null) army.flightTask.cancel();
-        if (army.jobTask != null) army.jobTask.cancel();
-
-        Location where = null;
-        for (NPC npc : army.npcs) {
-            if (where == null && npc.isSpawned()) where = npc.getEntity().getLocation();
-            npc.destroy();
-        }
-        npcOwner.values().removeIf(v -> v.equals(ownerId));
-
-        // close any portals that are still open (puts the old blocks back)
-        for (Portal p : army.portals) closePortal(p);
-
-        // remove blocks the army placed while chasing (bridges you ordered stay)
-        for (Block b : army.placed) {
-            if (b.getType() == army.placedType) b.setType(Material.AIR);
-        }
-        if (sound && where != null) {
-            where.getWorld().playSound(where, Sound.ENTITY_ENDERMAN_TELEPORT, 1f, 0.5f);
-        }
-    }
-
-    @EventHandler
-    public void onQuit(PlayerQuitEvent e) {
-        dismiss(e.getPlayer().getUniqueId(), false);
-    }
-
-    @EventHandler
-    public void onDeath(PlayerDeathEvent e) {
-        dismiss(e.getPlayer().getUniqueId(), false);
-    }
-        }
+        spot
