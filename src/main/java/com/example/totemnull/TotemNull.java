@@ -33,10 +33,12 @@ import org.bukkit.block.data.Orientable;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
+import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.enchantments.Enchantment;
 import org.bukkit.entity.AbstractArrow;
 import org.bukkit.entity.ArmorStand;
 import org.bukkit.entity.Arrow;
+import org.bukkit.entity.Enemy;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.EntityType;
 import org.bukkit.entity.LivingEntity;
@@ -61,6 +63,7 @@ import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.event.player.PlayerPortalEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.event.player.PlayerTeleportEvent;
+import org.bukkit.event.player.PlayerToggleSneakEvent;
 import org.bukkit.inventory.EquipmentSlot;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.meta.ItemMeta;
@@ -72,6 +75,8 @@ import org.bukkit.potion.PotionEffectType;
 import org.bukkit.scheduler.BukkitTask;
 import org.bukkit.util.Vector;
 
+import java.io.File;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -165,6 +170,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         final Map<NPC, Integer> idle = new HashMap<>();          // checks in a row where it could do nothing about being stuck
         final Map<NPC, Long> climbUntil = new HashMap<>();       // stacking blocks upward: keep going without pausing
         final Map<NPC, Long> lastShot = new HashMap<>();
+        final Map<NPC, UUID> huntTarget = new HashMap<>();       // hunt mode: each NULL's own target
         final Map<NPC, Location> focus = new HashMap<>();   // block an NPC is working on
         final Map<NPC, Long> busyUntil = new HashMap<>();
         final Map<NPC, Flight> flights = new HashMap<>();   // elytra-mace NULL that are in the air
@@ -179,6 +185,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         Location rally;      // null = follow the owner
         boolean captain = true;
         boolean dismissed = false;
+        boolean hunting = false;   // hunt mode: kill everything (except allies) near the owner
         int size = 20;       // total NULL (normal + mace)
         int baseCount = 15;  // NULL before the mace ones
         int pending = 0;     // NULL whose portal is open but who has not stepped out yet
@@ -194,8 +201,10 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
 
     private NamespacedKey totemKey;
     private NPCRegistry registry; // anonymous: NPCs are never saved to Citizens' data
+    private File alliesFile;
 
     private final Map<UUID, Army> armies = new HashMap<>();
+    private final Map<UUID, Set<UUID>> allies = new HashMap<>();   // commander -> players NULL never attack
     private final Set<Portal> activePortals = new HashSet<>();
     private final List<BurnZone> burnZones = new ArrayList<>();
     private final Map<UUID, UUID> npcOwner = new HashMap<>();      // NULL entity -> who commands it
@@ -206,6 +215,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
     private final Map<UUID, Long> lastMark = new HashMap<>();
     private final Map<UUID, Long> lastRally = new HashMap<>();
     private final Map<UUID, Long> lastOrder = new HashMap<>();
+    private final Map<UUID, Long> lastHunt = new HashMap<>();
     private final Map<UUID, Long> lastHorn = new HashMap<>();
 
     @Override
@@ -213,10 +223,13 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         saveDefaultConfig();
         totemKey = new NamespacedKey(this, "totem_of_null");
         registry = CitizensAPI.createAnonymousNPCRegistry(new MemoryNPCDataStore());
+        loadAllies();
         getServer().getPluginManager().registerEvents(this, this);
         getCommand("totemnull").setExecutor(this);
         getCommand("nullcall").setExecutor(this);
         getCommand("nullform").setExecutor(this);
+        getCommand("nullhunt").setExecutor(this);
+        getCommand("nullally").setExecutor(this);
     }
 
     @Override
@@ -226,6 +239,102 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         if (registry != null) registry.deregisterAll();
     }
 
+    // ---------- allies (saved in allies.yml) ----------
+    private void loadAllies() {
+        alliesFile = new File(getDataFolder(), "allies.yml");
+        if (!alliesFile.exists()) return;
+        YamlConfiguration y = YamlConfiguration.loadConfiguration(alliesFile);
+        for (String key : y.getKeys(false)) {
+            try {
+                UUID owner = UUID.fromString(key);
+                Set<UUID> set = new HashSet<>();
+                for (String s : y.getStringList(key)) set.add(UUID.fromString(s));
+                allies.put(owner, set);
+            } catch (IllegalArgumentException ignored) {
+                // skip a broken line
+            }
+        }
+    }
+
+    private void saveAllies() {
+        YamlConfiguration y = new YamlConfiguration();
+        for (Map.Entry<UUID, Set<UUID>> en : allies.entrySet()) {
+            List<String> list = new ArrayList<>();
+            for (UUID u : en.getValue()) list.add(u.toString());
+            y.set(en.getKey().toString(), list);
+        }
+        try {
+            getDataFolder().mkdirs();
+            y.save(alliesFile);
+        } catch (IOException ex) {
+            getLogger().warning("Could not save allies.yml: " + ex.getMessage());
+        }
+    }
+
+    private void handleAlly(Player owner, String[] args) {
+        Set<UUID> set = allies.computeIfAbsent(owner.getUniqueId(), k -> new HashSet<>());
+        String sub = args.length > 0 ? args[0].toLowerCase() : "list";
+
+        if (sub.equals("add")) {
+            if (args.length < 2) {
+                owner.sendMessage(Component.text("Use: /nullally add <player>", NamedTextColor.RED));
+                return;
+            }
+            Player t = Bukkit.getPlayerExact(args[1]);
+            if (t == null) {
+                owner.sendMessage(Component.text("That player must be online.", NamedTextColor.RED));
+                return;
+            }
+            if (t.equals(owner)) {
+                owner.sendMessage(Component.text("You are always safe from NULL.", NamedTextColor.GRAY));
+                return;
+            }
+            set.add(t.getUniqueId());
+            saveAllies();
+            owner.sendMessage(Component.text("NULL will never attack " + t.getName() + ".", NamedTextColor.DARK_GRAY));
+        } else if (sub.equals("remove")) {
+            if (args.length < 2) {
+                owner.sendMessage(Component.text("Use: /nullally remove <player>", NamedTextColor.RED));
+                return;
+            }
+            UUID found = null;
+            for (UUID u : set) {
+                String n = Bukkit.getOfflinePlayer(u).getName();
+                if (n != null && n.equalsIgnoreCase(args[1])) {
+                    found = u;
+                    break;
+                }
+            }
+            if (found == null) {
+                owner.sendMessage(Component.text("That player is not on your ally list.", NamedTextColor.RED));
+                return;
+            }
+            set.remove(found);
+            saveAllies();
+            owner.sendMessage(Component.text(args[1] + " is no longer an ally.", NamedTextColor.DARK_GRAY));
+        } else {
+            if (set.isEmpty()) {
+                owner.sendMessage(Component.text("No allies yet. Use /nullally add <player>.", NamedTextColor.GRAY));
+                return;
+            }
+            List<String> names = new ArrayList<>();
+            for (UUID u : set) {
+                String n = Bukkit.getOfflinePlayer(u).getName();
+                names.add(n != null ? n : u.toString());
+            }
+            owner.sendMessage(Component.text("Allies: " + String.join(", ", names), NamedTextColor.GRAY));
+        }
+    }
+
+    // players, pets and NULL that NULL never hurt: you, your tamed pets, and anyone on your ally list
+    private boolean isAlly(Player owner, Entity e) {
+        if (e.equals(owner)) return true;
+        if (e instanceof Tameable t && t.getOwner() != null
+                && t.getOwner().getUniqueId().equals(owner.getUniqueId())) return true;
+        Set<UUID> set = allies.get(owner.getUniqueId());
+        return set != null && set.contains(e.getUniqueId());
+    }
+
     // ---------- commands ----------
     @Override
     public boolean onCommand(CommandSender sender, Command cmd, String label, String[] args) {
@@ -233,6 +342,26 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         if (cmd.getName().equalsIgnoreCase("nullcall")) {
             if (sender instanceof Player caller) {
                 toggle(caller, true);
+            } else {
+                sender.sendMessage("Players only.");
+            }
+            return true;
+        }
+
+        // /nullhunt: turn hunt mode on or off
+        if (cmd.getName().equalsIgnoreCase("nullhunt")) {
+            if (sender instanceof Player hp) {
+                toggleHunt(hp, true);
+            } else {
+                sender.sendMessage("Players only.");
+            }
+            return true;
+        }
+
+        // /nullally add|remove|list
+        if (cmd.getName().equalsIgnoreCase("nullally")) {
+            if (sender instanceof Player ap) {
+                handleAlly(ap, args);
             } else {
                 sender.sendMessage("Players only.");
             }
@@ -357,10 +486,8 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
 
     private boolean canTarget(Player owner, Entity e) {
         if (!(e instanceof LivingEntity) || e instanceof ArmorStand) return false;
-        if (e.equals(owner) || e.isDead() || isNpc(e)) return false;
-        if (e instanceof Tameable t && t.getOwner() != null
-                && t.getOwner().getUniqueId().equals(owner.getUniqueId())) return false;
-        return true;
+        if (e.isDead() || isNpc(e)) return false;
+        return !isAlly(owner, e);
     }
 
     @EventHandler(ignoreCancelled = true)
@@ -368,11 +495,13 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         Entity victim = e.getEntity();
         Entity attacker = shooterOf(e.getDamager());
 
-        // friendly fire: NULL never hurt their commander, each other, or the commander's pets
+        // friendly fire: NULL never hurt their commander, each other, the commander's pets or allies
         UUID armyOwner = npcOwner.get(attacker.getUniqueId());
         if (armyOwner != null) {
+            Set<UUID> trusted = allies.get(armyOwner);
             boolean ally = victim.getUniqueId().equals(armyOwner)
                     || armyOwner.equals(npcOwner.get(victim.getUniqueId()))
+                    || (trusted != null && trusted.contains(victim.getUniqueId()))
                     || (victim instanceof Tameable pet && pet.getOwner() != null
                         && pet.getOwner().getUniqueId().equals(armyOwner));
             if (ally) {
@@ -463,6 +592,54 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         owner.sendActionBar(Component.text("NULL: burn " + clicked.getName(), NamedTextColor.GOLD));
     }
 
+    // sneak while holding a sword = hunt mode on / off
+    @EventHandler
+    public void onSneak(PlayerToggleSneakEvent e) {
+        Player owner = e.getPlayer();
+        if (isNpc(owner)) return;
+
+        // Bedrock's sneak button toggles, so every press counts there; on Java only the press counts
+        boolean bedrock = owner.getUniqueId().getMostSignificantBits() == 0L;   // Floodgate UUIDs
+        boolean countBoth = bedrock && getConfig().getBoolean("army.hunt-bedrock-both", true);
+        if (!e.isSneaking() && !countBoth) return;
+        if (!isSword(owner.getInventory().getItemInMainHand().getType())) return;
+
+        toggleHunt(owner, false);
+    }
+
+    private boolean isSword(Material m) {
+        return m.name().endsWith("_SWORD");
+    }
+
+    private void toggleHunt(Player owner, boolean viaCommand) {
+        Army army = armies.get(owner.getUniqueId());
+        if (army == null) {
+            if (viaCommand) owner.sendActionBar(Component.text("Blow the Call horn first.", NamedTextColor.RED));
+            return;
+        }
+        if (!hasTotem(owner)) {
+            if (viaCommand) owner.sendActionBar(Component.text("You need the Totem of NULL.", NamedTextColor.RED));
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (now - lastHunt.getOrDefault(owner.getUniqueId(), 0L) < 400) return;
+        lastHunt.put(owner.getUniqueId(), now);
+
+        army.hunting = !army.hunting;
+        army.huntTarget.clear();
+        army.engaged.clear();
+        army.lastDest.clear();
+
+        double r = getConfig().getDouble("army.hunt-radius", 20.0);
+        if (army.hunting) {
+            owner.sendActionBar(Component.text("NULL: HUNT ON (" + (int) r + " blocks)", NamedTextColor.DARK_RED));
+            owner.getWorld().playSound(owner.getLocation(), Sound.ENTITY_WITHER_AMBIENT, 0.8f, 0.7f);
+        } else {
+            owner.sendActionBar(Component.text("NULL: HUNT OFF", NamedTextColor.GRAY));
+            owner.getWorld().playSound(owner.getLocation(), Sound.ENTITY_EXPERIENCE_ORB_PICKUP, 0.6f, 0.5f);
+        }
+    }
+
     // sneak + right-click a block with the totem = rally point, sneak + right-click the air = follow me again
     @EventHandler
     public void onRally(PlayerInteractEvent e) {
@@ -496,9 +673,8 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         }
 
         army.lastDest.clear();
-        LivingEntity t = liveTarget(owner, army.targetId);
         for (NPC npc : army.npcs) {
-            if (npc.isSpawned() && !army.flights.containsKey(npc)) steerOne(owner, army, npc, t);
+            if (npc.isSpawned() && !army.flights.containsKey(npc)) steerOne(owner, army, npc, targetFor(owner, army, npc));
         }
     }
 
@@ -573,6 +749,75 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         long age = System.currentTimeMillis() - lastTargetTime.getOrDefault(owner.getUniqueId(), 0L);
         if (age > TARGET_WINDOW_MS) return null;
         return liveTarget(owner, id);
+    }
+
+    // what this NULL is after right now: its own hunt target (hunt mode), else the army's target
+    private LivingEntity targetFor(Player owner, Army army, NPC npc) {
+        if (army.hunting) {
+            UUID id = army.huntTarget.get(npc);
+            LivingEntity t = id == null ? null : liveTarget(owner, id);
+            if (t != null) return t;
+        }
+        return liveTarget(owner, army.targetId);
+    }
+
+    // ---------- hunt mode ----------
+
+    // everything within the hunt radius of the owner that NULL may attack
+    private List<LivingEntity> scanHuntables(Player owner) {
+        double r = getConfig().getDouble("army.hunt-radius", 20.0);
+        boolean players = getConfig().getBoolean("army.hunt-players", true);
+        boolean passive = getConfig().getBoolean("army.hunt-passive", true);
+        Location o = owner.getLocation();
+
+        List<LivingEntity> out = new ArrayList<>();
+        for (Entity e : owner.getNearbyEntities(r, r, r)) {
+            if (!(e instanceof LivingEntity le) || le instanceof ArmorStand) continue;
+            if (le.isDead() || !le.isValid() || isNpc(le) || le.isInvulnerable()) continue;
+            if (le.getLocation().distanceSquared(o) > r * r) continue;
+            if (isAlly(owner, le)) continue;
+            if (le instanceof Player p) {
+                if (!players || p.getGameMode() == GameMode.CREATIVE || p.getGameMode() == GameMode.SPECTATOR) continue;
+            } else if (!passive && !(le instanceof Enemy)) {
+                continue;
+            }
+            out.add(le);
+        }
+        return out;
+    }
+
+    // each NULL hunts the nearest thing in range; keeps its target until it dies or leaves the area
+    private LivingEntity assignHunt(Player owner, Army army, NPC npc, List<LivingEntity> pool, LivingEntity fallback) {
+        double r = getConfig().getDouble("army.hunt-radius", 20.0);
+        UUID curId = army.huntTarget.get(npc);
+        LivingEntity cur = curId == null ? null : liveTarget(owner, curId);
+        if (cur != null && !isAlly(owner, cur)
+                && cur.getLocation().distanceSquared(owner.getLocation()) <= (r + 6) * (r + 6)) {
+            return cur;
+        }
+
+        Location nl = npc.getEntity().getLocation();
+        LivingEntity best = null;
+        double bestD = Double.MAX_VALUE;
+        for (LivingEntity le : pool) {
+            if (!le.getWorld().equals(nl.getWorld())) continue;
+            double d = le.getLocation().distanceSquared(nl);
+            if (d < bestD) {
+                bestD = d;
+                best = le;
+            }
+        }
+
+        if (best == null) {
+            army.huntTarget.remove(npc);
+            return fallback;
+        }
+        if (curId == null || !best.getUniqueId().equals(curId)) {
+            army.engaged.remove(npc);
+            army.lastDest.remove(npc);
+        }
+        army.huntTarget.put(npc, best.getUniqueId());
+        return best;
     }
 
     // ---------- horn / command: summon once, again = vanish ----------
@@ -992,7 +1237,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         }
 
         // start walking right away
-        steerOne(owner, army, npc, liveTarget(owner, army.targetId));
+        steerOne(owner, army, npc, targetFor(owner, army, npc));
     }
 
     // a NULL was killed: clean up and (if enabled) send a replacement through a new portal
@@ -1018,6 +1263,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         army.stuck.remove(dead);
         army.idle.remove(dead);
         army.climbUntil.remove(dead);
+        army.huntTarget.remove(dead);
         army.lastPos.remove(dead);
         army.lastDest.remove(dead);
         army.focus.remove(dead);
@@ -1042,13 +1288,13 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         }, delay);
     }
 
-    // new target (or null = no target: follow the owner / hold the rally point)
+    // new army target (or null = no target: follow the owner / hold the rally point)
     private void command(Player owner, Army army, LivingEntity target) {
         army.targetId = target == null ? null : target.getUniqueId();
         army.engaged.clear();
         army.lastDest.clear();
         for (NPC npc : army.npcs) {
-            if (npc.isSpawned() && !army.flights.containsKey(npc)) steerOne(owner, army, npc, target);
+            if (npc.isSpawned() && !army.flights.containsKey(npc)) steerOne(owner, army, npc, targetFor(owner, army, npc));
         }
     }
 
@@ -1065,9 +1311,15 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
             army.rally.getWorld().spawnParticle(Particle.PORTAL, army.rally.clone().add(0, 0.6, 0), 10, 0.4, 0.4, 0.4, 0.2);
         }
 
-        LivingEntity target = liveTarget(owner, army.targetId);
-        if (army.targetId != null && target == null) {
+        LivingEntity armyTarget = liveTarget(owner, army.targetId);
+        if (army.targetId != null && armyTarget == null) {
             command(owner, army, null);                 // target died / left
+        }
+
+        // hunt mode: look around the owner once, then every NULL picks its own prey
+        List<LivingEntity> huntables = army.hunting ? scanHuntables(owner) : null;
+        if (army.hunting && army.ticks % 20 == 0) {
+            owner.sendActionBar(Component.text("NULL hunting: " + huntables.size() + " in range", NamedTextColor.DARK_RED));
         }
 
         long now = System.currentTimeMillis();
@@ -1077,6 +1329,10 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
             if (!npc.isSpawned()) continue;
             if (army.flights.containsKey(npc)) continue;   // in the air: flightTick drives it
             if (army.busy.contains(npc)) continue;         // carrying out an order: jobTick drives it
+
+            LivingEntity target = army.hunting
+                    ? assignHunt(owner, army, npc, huntables, armyTarget)
+                    : armyTarget;
 
             Location here = npc.getEntity().getLocation();
             if (target != null && army.roles.get(npc) == Role.MACE
@@ -1109,7 +1365,6 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
     private void lookTick(Player owner, Army army) {
         if (army.dismissed) return;
         long now = System.currentTimeMillis();
-        LivingEntity target = liveTarget(owner, army.targetId);
 
         for (NPC npc : army.npcs) {
             if (!npc.isSpawned() || army.flights.containsKey(npc) || army.busy.contains(npc)) continue;
@@ -1120,6 +1375,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
                 npc.faceLocation(focus);                          // looking at the block it is mining/placing
                 continue;
             }
+            LivingEntity target = targetFor(owner, army, npc);
             if (target != null && army.engaged.contains(npc) && army.roles.get(npc) != Role.ARCHER) {
                 Location here = npc.getEntity().getLocation();
                 if (here.getWorld().equals(target.getWorld())
@@ -1514,7 +1770,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
                 continue;
             }
 
-            LivingEntity target = liveTarget(owner, army.targetId);
+            LivingEntity target = targetFor(owner, army, npc);
             Entity ne = npc.getEntity();
             Location cur = ne.getLocation();
             f.ticks++;
@@ -2001,4 +2257,4 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
     public void onDeath(PlayerDeathEvent e) {
         dismiss(e.getPlayer().getUniqueId(), false);
     }
-            }
+        }
