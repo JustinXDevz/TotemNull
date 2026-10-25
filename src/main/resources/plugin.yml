@@ -27,10 +27,14 @@ commands:
     description: Manage the players NULL will never attack
     usage: /nullally <add|remove|list> [player]
     permission: totemnull.use
+  nulltarget:
+    description: Send NULL through a portal to kill a player, however far away
+    usage: /nulltarget <player|cancel>
+    permission: totemnull.use
 permissions:
   totemnull.give:
     description: Allows /totemnull
     default: op
   totemnull.use:
-    description: Allows /nullcall, /nullform, /nullhunt and /nullally
+    description: Allows /nullcall, /nullform, /nullhunt, /nullally and /nulltarget
     default: true
