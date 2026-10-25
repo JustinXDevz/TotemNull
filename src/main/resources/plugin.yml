@@ -19,10 +19,18 @@ commands:
     usage: /nullform <ring|charge|scatter>
     aliases: [nullformation]
     permission: totemnull.use
+  nullhunt:
+    description: Turn NULL hunt mode on or off
+    usage: /nullhunt
+    permission: totemnull.use
+  nullally:
+    description: Manage the players NULL will never attack
+    usage: /nullally <add|remove|list> [player]
+    permission: totemnull.use
 permissions:
   totemnull.give:
     description: Allows /totemnull
     default: op
   totemnull.use:
-    description: Allows /nullcall and /nullform
+    description: Allows /nullcall, /nullform, /nullhunt and /nullally
     default: true
