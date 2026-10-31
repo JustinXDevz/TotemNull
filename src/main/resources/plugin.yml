@@ -31,6 +31,11 @@ commands:
     description: Send NULL through a portal to kill a player, however far away
     usage: /nulltarget <player|cancel>
     permission: totemnull.use
+  nullgo:
+    description: Step out of a nether portal in front of a player
+    usage: /nullgo <player>
+    aliases: [nullportal]
+    permission: totemnull.go
 permissions:
   totemnull.give:
     description: Allows /totemnull
@@ -38,3 +43,6 @@ permissions:
   totemnull.use:
     description: Allows /nullcall, /nullform, /nullhunt, /nullally and /nulltarget
     default: true
+  totemnull.go:
+    description: Allows /nullgo
+    default: op
