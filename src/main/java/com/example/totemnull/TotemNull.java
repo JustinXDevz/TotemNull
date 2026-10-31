@@ -123,6 +123,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
     private static class Portal {
         final List<BlockState> originals = new ArrayList<>();
         Location center;
+        boolean axisX;          // true = the portal is wide along X
         boolean closed = false;
     }
 
@@ -247,6 +248,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
     private final Map<UUID, Long> lastRally = new HashMap<>();
     private final Map<UUID, Long> lastOrder = new HashMap<>();
     private final Map<UUID, Long> lastHunt = new HashMap<>();
+    private final Map<UUID, Long> lastGo = new HashMap<>();
     private final Map<UUID, Long> lastHorn = new HashMap<>();
 
     @Override
@@ -262,6 +264,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         getCommand("nullhunt").setExecutor(this);
         getCommand("nullally").setExecutor(this);
         getCommand("nulltarget").setExecutor(this);
+        getCommand("nullgo").setExecutor(this);
     }
 
     @Override
@@ -404,6 +407,16 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         if (cmd.getName().equalsIgnoreCase("nulltarget")) {
             if (sender instanceof Player tp) {
                 handleNullTarget(tp, args);
+            } else {
+                sender.sendMessage("Players only.");
+            }
+            return true;
+        }
+
+        // /nullgo <player>: step out of a nether portal in front of them
+        if (cmd.getName().equalsIgnoreCase("nullgo")) {
+            if (sender instanceof Player gp) {
+                handleGo(gp, args);
             } else {
                 sender.sendMessage("Players only.");
             }
@@ -899,6 +912,157 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         return best;
     }
 
+    // ---------- /nullgo: step out of a nether portal in front of a player ----------
+
+    private void handleGo(Player owner, String[] args) {
+        if (getConfig().getBoolean("army.nullgo-require-totem", true) && !hasTotem(owner)) {
+            owner.sendMessage(Component.text("You need the Totem of NULL.", NamedTextColor.RED));
+            return;
+        }
+        if (args.length == 0) {
+            owner.sendMessage(Component.text("Use: /nullgo <player>", NamedTextColor.GRAY));
+            return;
+        }
+        Player found = Bukkit.getPlayerExact(args[0]);
+        if (found == null) found = Bukkit.getPlayer(args[0]);
+        if (found == null) {
+            owner.sendMessage(Component.text("That player is not online.", NamedTextColor.RED));
+            return;
+        }
+        final Player target = found;
+        if (target.equals(owner)) {
+            owner.sendMessage(Component.text("You are already there.", NamedTextColor.GRAY));
+            return;
+        }
+
+        long now = System.currentTimeMillis();
+        long cooldown = (long) (getConfig().getDouble("army.nullgo-cooldown-seconds", 8.0) * 1000);
+        if (now - lastGo.getOrDefault(owner.getUniqueId(), 0L) < cooldown) {
+            owner.sendActionBar(Component.text("The portal is still cooling down.", NamedTextColor.RED));
+            return;
+        }
+
+        final Portal portal = openPortalFacing(owner, target);
+        if (portal == null) {
+            owner.sendMessage(Component.text("No room for a portal in front of " + target.getName()
+                    + " (or it is protected).", NamedTextColor.RED));
+            return;
+        }
+        lastGo.put(owner.getUniqueId(), now);
+        registerPortal(portal);
+
+        owner.sendActionBar(Component.text("NULL portal: " + target.getName(), NamedTextColor.DARK_PURPLE));
+        Location from = owner.getLocation();
+        from.getWorld().spawnParticle(Particle.PORTAL, from.clone().add(0, 1, 0), 60, 0.4, 0.8, 0.4, 0.5);
+        from.getWorld().playSound(from, Sound.BLOCK_PORTAL_TRAVEL, 0.5f, 1.4f);
+
+        // one second of effects, then you step out of the portal
+        Bukkit.getScheduler().runTaskLater(this, () -> {
+            if (!owner.isOnline()) return;
+            Location before = owner.getLocation();
+            before.getWorld().spawnParticle(Particle.PORTAL, before.clone().add(0, 1, 0), 60, 0.4, 0.8, 0.4, 0.5);
+
+            Location exit = exitSpot(portal, target);
+            owner.teleport(exit, PlayerTeleportEvent.TeleportCause.PLUGIN);
+            exit.getWorld().playSound(exit, Sound.ENTITY_ENDERMAN_TELEPORT, 1f, 0.8f);
+            exit.getWorld().spawnParticle(Particle.PORTAL, exit.clone().add(0, 1, 0), 60, 0.4, 0.8, 0.4, 0.5);
+            bringArmy(owner, exit);
+        }, 20L);
+
+        long stay = (long) (getConfig().getDouble("army.nullgo-stay-seconds", 4.0) * 20);
+        Bukkit.getScheduler().runTaskLater(this, () -> closePortal(portal), 20L + Math.max(20L, stay));
+    }
+
+    // opens a portal 5-6 blocks in front of the player (the way they are looking), turned to face them
+    private Portal openPortalFacing(Player owner, Player target) {
+        Location t = target.getLocation();
+        World w = t.getWorld();
+
+        Vector dir = t.getDirection().setY(0);
+        if (dir.lengthSquared() < 0.01) dir = new Vector(0, 0, 1);
+        dir.normalize();
+        boolean axisX = Math.abs(dir.getZ()) >= Math.abs(dir.getX());   // looking along Z: the portal is wide along X
+        Vector side = new Vector(-dir.getZ(), 0, dir.getX());
+
+        double[] sides = {0, 2, -2, 4, -4};
+        double[] dists = {5.5, 5.0, 6.0, 4.5, 6.5, 7.0};
+        for (double lat : sides) {
+            for (double dist : dists) {
+                double x = t.getX() + dir.getX() * dist + side.getX() * lat;
+                double z = t.getZ() + dir.getZ() * dist + side.getZ() * lat;
+                int bx = axisX ? (int) Math.round(x - 2.0) : (int) Math.floor(x);
+                int bz = axisX ? (int) Math.floor(z) : (int) Math.round(z - 2.0);
+
+                int endX = bx + (axisX ? 3 : 0);
+                int endZ = bz + (axisX ? 0 : 3);
+                if (!w.isChunkLoaded(bx >> 4, bz >> 4) || !w.isChunkLoaded(endX >> 4, endZ >> 4)) continue;
+                int by = findGround(w, bx, t.getBlockY(), bz);
+                if (by == Integer.MIN_VALUE) continue;
+                if (by < w.getMinHeight() + 1 || by + 5 >= w.getMaxHeight()) continue;
+
+                Portal p = tryBuild(owner, w, bx, by, bz, axisX);
+                if (p != null) return p;
+            }
+        }
+        return null;
+    }
+
+    // where you step out: just in front of the portal, on the side the player is on
+    private Location exitSpot(Portal p, Player target) {
+        Location c = p.center.clone();
+        Location tl = target.getLocation();
+        double sx = 0;
+        double sz = 0;
+        if (tl.getWorld().equals(c.getWorld())) {
+            if (p.axisX) {
+                sz = Math.signum(tl.getZ() - c.getZ());
+            } else {
+                sx = Math.signum(tl.getX() - c.getX());
+            }
+        }
+        if (sx == 0 && sz == 0) {
+            if (p.axisX) {
+                sz = 1;
+            } else {
+                sx = 1;
+            }
+        }
+
+        Location e = c.clone().add(sx * 1.6, 0, sz * 1.6);
+        if (!(e.getBlock().isPassable() && e.clone().add(0, 1, 0).getBlock().isPassable())) e = c.clone();
+        if (tl.getWorld().equals(e.getWorld())) {
+            e.setDirection(tl.toVector().subtract(e.toVector()));      // face the player
+        }
+        return e;
+    }
+
+    // your NULL follow you out of the portal, one by one
+    private void bringArmy(Player owner, Location exit) {
+        Army army = armies.get(owner.getUniqueId());
+        if (army == null || !getConfig().getBoolean("army.nullgo-bring-army", true)) return;
+
+        army.rally = null;
+        army.lastDest.clear();
+        army.engaged.clear();
+
+        int i = 0;
+        for (NPC npc : new ArrayList<>(army.npcs)) {
+            if (!npc.isSpawned() || army.busy.contains(npc) || army.flights.containsKey(npc)) continue;
+            final int idx = Math.max(0, army.npcs.indexOf(npc));
+            Bukkit.getScheduler().runTaskLater(this, () -> {
+                if (army.dismissed || !npc.isSpawned() || !owner.isOnline()) return;
+                Location base = owner.getLocation();
+                Location spot = safeSpot(slot(army, base, idx, false), base);
+                npc.getNavigator().cancelNavigation();
+                npc.teleport(spot, PlayerTeleportEvent.TeleportCause.PLUGIN);
+                spot.getWorld().spawnParticle(Particle.PORTAL, spot.clone().add(0, 1, 0), 20, 0.3, 0.6, 0.3, 0.3);
+                spot.getWorld().playSound(spot, Sound.ENTITY_ENDERMAN_TELEPORT, 0.4f, 1.2f);
+                army.lastDest.remove(npc);
+            }, 4L + i * 3L);
+            i++;
+        }
+    }
+
     // ---------- /nulltarget ----------
 
     private void handleNullTarget(Player owner, String[] args) {
@@ -944,11 +1108,16 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         return p;
     }
 
-    private void trackPortal(Army army, Portal p) {
-        army.portals.add(p);
+    // starts tracking a portal (sound + particles) so events near it are handled and it is closed on shutdown
+    private void registerPortal(Portal p) {
         activePortals.add(p);
         p.center.getWorld().playSound(p.center, Sound.BLOCK_PORTAL_TRIGGER, 0.6f, 1.2f);
         p.center.getWorld().spawnParticle(Particle.PORTAL, p.center.clone().add(0, 1, 0), 60, 0.6, 1.0, 0.6, 0.4);
+    }
+
+    private void trackPortal(Army army, Portal p) {
+        army.portals.add(p);
+        registerPortal(p);
     }
 
     private void startMission(Player owner, Army army, Player target) {
@@ -1334,6 +1503,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         if (!allowedToBuild(owner, w.getBlockAt(bx, by, bz))) return null; // protection plugins can say no
 
         Portal p = new Portal();
+        p.axisX = axisX;
         BlockData portalData = Material.NETHER_PORTAL.createBlockData();
         if (portalData instanceof Orientable orientable) {
             orientable.setAxis(axisX ? Axis.X : Axis.Z);
@@ -2295,7 +2465,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         }
 
         if (smashed) {
-long cooldownMs = (long) (getConfig().getDouble("army.mace-cooldown-seconds", 8.0) * 1000);
+            long cooldownMs = (long) (getConfig().getDouble("army.mace-cooldown-seconds", 8.0) * 1000);
             army.maceReady.put(npc, System.currentTimeMillis() + cooldownMs);
         } else {
             maceBackoff(army, npc);
@@ -2676,4 +2846,4 @@ long cooldownMs = (long) (getConfig().getDouble("army.mace-cooldown-seconds", 8.
     public void onDeath(PlayerDeathEvent e) {
         dismiss(e.getPlayer().getUniqueId(), false);
     }
-                              }
+                }
