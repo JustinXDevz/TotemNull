@@ -14,6 +14,7 @@ import net.kyori.adventure.text.format.TextDecoration;
 import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
 import org.bukkit.Axis;
 import org.bukkit.Bukkit;
+import org.bukkit.FluidCollisionMode;
 import org.bukkit.GameMode;
 import org.bukkit.Location;
 import org.bukkit.Material;
@@ -41,6 +42,7 @@ import org.bukkit.entity.Arrow;
 import org.bukkit.entity.Enemy;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.EntityType;
+import org.bukkit.entity.Flying;
 import org.bukkit.entity.LivingEntity;
 import org.bukkit.entity.Player;
 import org.bukkit.entity.Projectile;
@@ -73,6 +75,7 @@ import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.potion.PotionEffect;
 import org.bukkit.potion.PotionEffectType;
 import org.bukkit.scheduler.BukkitTask;
+import org.bukkit.util.RayTraceResult;
 import org.bukkit.util.Vector;
 
 import java.io.File;
@@ -92,11 +95,9 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
 
     private static final long TARGET_WINDOW_MS = 30_000; // a hit/attack counts as "target" for this long before summoning
     private static final long HORN_DEBOUNCE_MS = 700;
-    private static final long MARK_LOCK_MS = 10_000;     // a manual mark beats automatic targeting for this long
     private static final long TICK = 5L;                 // how often the army "thinks" (5 ticks = 0.25 s)
     private static final double ARCHER_RANGE = 16;
-    private static final long ARCHER_COOLDOWN_MS = 1_500;
-    private static final double ARROW_DAMAGE = 4.0;
+    private static final long ARCHER_COOLDOWN_MS = 900;
     private static final long PORTAL_OPEN_TICKS = 15;    // portal opens this long before the NULL steps out
     private static final long PORTAL_STAY_TICKS = 45;    // ...and stays open this long after
     private static final double PORTAL_MIN_DIST = 6;
@@ -107,10 +108,14 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
     private static final int JOB_MAX_TICKS = 20 * 40;    // an order is dropped after 40 seconds
     private static final int BRIDGE_BLOCKS_PER_STEP = 6; // blocks placed every 2 ticks while bridging
     private static final double HOME_TELEPORT_DIST = 150; // NULL farther than this from home pop back to it
+    private static final long THREAT_MEMORY_MS = 20_000; // how long an attacker stays on the target list
+    private static final long SWITCH_LOCK_MS = 3_000;    // a NULL keeps its target at least this long
 
     private enum Formation { RING, CHARGE, SCATTER }
 
     private enum Role { CAPTAIN, SWORD, AXE, ARCHER, MACE }
+
+    private enum Weapon { SWORD, AXE, BOW, MACE }
 
     private enum JobType { BURN, BLAST, BRIDGE }
 
@@ -182,6 +187,12 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
     private static class Army {
         final List<NPC> npcs = new ArrayList<>();
         final Map<NPC, Role> roles = new HashMap<>();
+        final Map<NPC, Weapon> weapon = new HashMap<>();         // what each NULL is holding right now
+        final Map<NPC, Long> swapReady = new HashMap<>();        // when it may swap weapons again
+        final Map<NPC, Long> windReady = new HashMap<>();        // when "second wind" is ready again
+        final Map<NPC, UUID> assigned = new HashMap<>();         // each NULL's own current target
+        final Map<NPC, Long> switchUntil = new HashMap<>();      // a NULL keeps its target until then
+        final Map<UUID, Long> threats = new HashMap<>();         // things that attacked us (or we attacked) -> last time
         final Map<UUID, NPC> byEntity = new HashMap<>();
         final Map<NPC, Location> lastPos = new HashMap<>();
         final Map<NPC, Location> lastDest = new HashMap<>();
@@ -189,11 +200,11 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         final Map<NPC, Integer> idle = new HashMap<>();          // checks in a row where it could do nothing about being stuck
         final Map<NPC, Long> climbUntil = new HashMap<>();       // stacking blocks upward: keep going without pausing
         final Map<NPC, Long> lastShot = new HashMap<>();
-        final Map<NPC, UUID> huntTarget = new HashMap<>();       // hunt mode: each NULL's own target
         final Map<NPC, Location> focus = new HashMap<>();   // block an NPC is working on
         final Map<NPC, Long> busyUntil = new HashMap<>();
         final Map<NPC, Flight> flights = new HashMap<>();   // elytra-mace NULL that are in the air
         final Map<NPC, Long> maceReady = new HashMap<>();   // when a mace NULL may take off again
+        final Map<NPC, Integer> maceFails = new HashMap<>(); // failed dives in a row (makes the wait longer)
         final Set<NPC> engaged = new HashSet<>();
         final Set<NPC> busy = new HashSet<>();              // NULL carrying out an order or travelling
         final List<Job> jobs = new ArrayList<>();
@@ -210,7 +221,8 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         int baseCount = 15;  // NULL before the mace ones
         int pending = 0;     // NULL whose portal is open but who has not stepped out yet
         int replacements = 0;
-        UUID targetId;       // null = no target
+        UUID focusId;        // a target you marked: everyone goes for it
+        long focusUntil = 0;
         BukkitTask task;
         BukkitTask spawnTask;
         BukkitTask lookTask;
@@ -231,7 +243,6 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
     private final Map<UUID, Formation> formations = new HashMap<>();
     private final Map<UUID, UUID> lastTarget = new HashMap<>();
     private final Map<UUID, Long> lastTargetTime = new HashMap<>();
-    private final Map<UUID, Long> markLock = new HashMap<>();
     private final Map<UUID, Long> lastMark = new HashMap<>();
     private final Map<UUID, Long> lastRally = new HashMap<>();
     private final Map<UUID, Long> lastOrder = new HashMap<>();
@@ -503,7 +514,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         return false;
     }
 
-    // ---------- targets: whatever the holder hits, whatever hits the holder, or what they right-click ----------
+    // ---------- targets: whatever the holder hits, whatever hits the holder or a NULL, or what they right-click ----------
     private boolean isNpc(Entity e) {
         return e.hasMetadata("NPC");
     }
@@ -539,6 +550,13 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
                 e.setCancelled(true);
                 return;
             }
+        }
+
+        // something hit one of our NULL: it goes on the target list
+        UUID victimOwner = npcOwner.get(victim.getUniqueId());
+        if (victimOwner != null) {
+            Player vo = Bukkit.getPlayer(victimOwner);
+            if (vo != null && canTarget(vo, attacker)) noteTarget(vo, attacker, false);
         }
 
         // holder attacks something
@@ -657,7 +675,8 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         lastHunt.put(owner.getUniqueId(), now);
 
         army.hunting = !army.hunting;
-        army.huntTarget.clear();
+        army.assigned.clear();
+        army.switchUntil.clear();
         army.engaged.clear();
         army.lastDest.clear();
 
@@ -746,22 +765,21 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         giveOrder(owner, army, type, onBlock ? e.getClickedBlock() : null);
     }
 
+    // puts something on the army's target list (manual = you marked it: everyone focuses it for 15 s)
     private void noteTarget(Player owner, Entity target, boolean manual) {
         UUID oid = owner.getUniqueId();
         long now = System.currentTimeMillis();
 
-        if (!manual && now < markLock.getOrDefault(oid, 0L)) {
-            Army a = armies.get(oid);
-            LivingEntity current = a != null ? liveTarget(owner, a.targetId) : recentTarget(owner);
-            if (current != null) return;          // a manual mark is still active
-        }
-        if (manual) markLock.put(oid, now + MARK_LOCK_MS);
-
         lastTarget.put(oid, target.getUniqueId());
         lastTargetTime.put(oid, now);
+
         Army army = armies.get(oid);
-        if (army != null && !target.getUniqueId().equals(army.targetId)) {
-            command(owner, army, (LivingEntity) target);
+        if (army == null) return;
+        army.threats.put(target.getUniqueId(), now);
+        if (manual) {
+            army.focusId = target.getUniqueId();
+            army.focusUntil = now + 15_000;
+            army.switchUntil.clear();            // everyone may switch to the marked target right away
         }
     }
 
@@ -782,20 +800,103 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         return liveTarget(owner, id);
     }
 
-    // what this NULL is after right now: the /nulltarget player (once through the portal),
-    // its own hunt target (hunt mode), else the army's target
+    // what this NULL is after right now: the /nulltarget player (once through the portal), else its own target
     private LivingEntity targetFor(Player owner, Army army, NPC npc) {
         Mission m = army.mission;
         if (m != null && m.arrived.contains(npc)) {
             Player t = missionTarget(owner, m);
             if (t != null) return t;
         }
-        if (army.hunting) {
-            UUID id = army.huntTarget.get(npc);
-            LivingEntity t = id == null ? null : liveTarget(owner, id);
-            if (t != null) return t;
+        UUID id = army.assigned.get(npc);
+        return id == null ? null : liveTarget(owner, id);
+    }
+
+    // ---------- target choice: every NULL picks its own target, and sticks to it ----------
+
+    // everything the army may fight right now: things that attacked us, plus everything in range in hunt mode
+    private List<LivingEntity> candidates(Player owner, Army army, List<LivingEntity> huntables) {
+        long now = System.currentTimeMillis();
+        army.threats.values().removeIf(t -> now - t > THREAT_MEMORY_MS);
+
+        Location o = owner.getLocation();
+        Set<UUID> seen = new HashSet<>();
+        List<LivingEntity> out = new ArrayList<>();
+        for (UUID id : new ArrayList<>(army.threats.keySet())) {
+            LivingEntity le = liveTarget(owner, id);
+            if (le == null) {
+                army.threats.remove(id);
+                continue;
+            }
+            if (isAlly(owner, le)) continue;
+            if (le.getLocation().distanceSquared(o) > 100 * 100) continue;
+            if (seen.add(id)) out.add(le);
         }
-        return liveTarget(owner, army.targetId);
+        if (huntables != null) {
+            for (LivingEntity le : huntables) {
+                if (seen.add(le.getUniqueId())) out.add(le);
+            }
+        }
+        return out;
+    }
+
+    // lower = better target for this NULL
+    private double targetScore(Army army, LivingEntity c, Location from, Map<UUID, Integer> load, boolean mine) {
+        double s = from.distance(c.getLocation());
+        if (army.threats.containsKey(c.getUniqueId())) s -= 12;      // it attacked us
+        if (c instanceof Player) s -= 4;                              // players are the real danger
+        if (c.getHealth() <= 8) s -= 3;                               // nearly dead: finish it
+        int crowd = load.getOrDefault(c.getUniqueId(), 0) - (mine ? 1 : 0);
+        s += 5.0 * Math.max(0, crowd);                                // spread out over the enemies
+        return s;
+    }
+
+    private LivingEntity assignTarget(Player owner, Army army, NPC npc, List<LivingEntity> cands,
+                                      Map<UUID, Integer> load) {
+        long now = System.currentTimeMillis();
+        UUID curId = army.assigned.get(npc);
+        LivingEntity cur = curId == null ? null : liveTarget(owner, curId);
+        if (cur != null && isAlly(owner, cur)) cur = null;
+
+        // a target you marked beats everything for a while
+        if (army.focusId != null && now < army.focusUntil) {
+            LivingEntity focus = liveTarget(owner, army.focusId);
+            if (focus != null && !isAlly(owner, focus)) {
+                army.assigned.put(npc, focus.getUniqueId());
+                return focus;
+            }
+        }
+
+        // keep the current target for a few seconds so they stop flip-flopping
+        if (cur != null && now < army.switchUntil.getOrDefault(npc, 0L)) return cur;
+
+        Location nl = npc.getEntity().getLocation();
+        LivingEntity best = null;
+        double bestScore = Double.MAX_VALUE;
+        double curScore = Double.MAX_VALUE;
+        for (LivingEntity c : cands) {
+            if (!c.getWorld().equals(nl.getWorld())) continue;
+            boolean mine = c.getUniqueId().equals(curId);
+            double s = targetScore(army, c, nl, load, mine);
+            if (mine) curScore = s;
+            if (s < bestScore) {
+                bestScore = s;
+                best = c;
+            }
+        }
+
+        if (best == null) {
+            army.assigned.remove(npc);
+            return null;
+        }
+        if (cur != null && curScore <= bestScore + 10) return cur;   // not worth switching
+
+        if (!best.getUniqueId().equals(curId)) {
+            army.engaged.remove(npc);
+            army.lastDest.remove(npc);
+            army.switchUntil.put(npc, now + SWITCH_LOCK_MS);
+        }
+        army.assigned.put(npc, best.getUniqueId());
+        return best;
     }
 
     // ---------- /nulltarget ----------
@@ -1020,40 +1121,6 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         return out;
     }
 
-    // each NULL hunts the nearest thing in range; keeps its target until it dies or leaves the area
-    private LivingEntity assignHunt(Player owner, Army army, NPC npc, List<LivingEntity> pool, LivingEntity fallback) {
-        double r = getConfig().getDouble("army.hunt-radius", 20.0);
-        UUID curId = army.huntTarget.get(npc);
-        LivingEntity cur = curId == null ? null : liveTarget(owner, curId);
-        if (cur != null && !isAlly(owner, cur)
-                && cur.getLocation().distanceSquared(owner.getLocation()) <= (r + 6) * (r + 6)) {
-            return cur;
-        }
-
-        Location nl = npc.getEntity().getLocation();
-        LivingEntity best = null;
-        double bestD = Double.MAX_VALUE;
-        for (LivingEntity le : pool) {
-            if (!le.getWorld().equals(nl.getWorld())) continue;
-            double d = le.getLocation().distanceSquared(nl);
-            if (d < bestD) {
-                bestD = d;
-                best = le;
-            }
-        }
-
-        if (best == null) {
-            army.huntTarget.remove(npc);
-            return fallback;
-        }
-        if (curId == null || !best.getUniqueId().equals(curId)) {
-            army.engaged.remove(npc);
-            army.lastDest.remove(npc);
-        }
-        army.huntTarget.put(npc, best.getUniqueId());
-        return best;
-    }
-
     // ---------- horn / command: summon once, again = vanish ----------
     @EventHandler
     public void onHorn(PlayerInteractEvent e) {
@@ -1093,7 +1160,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         }
     }
 
-    // ---------- gear ----------
+    // ---------- gear (levels above vanilla on purpose) ----------
     private ItemStack enchanted(Material type, Object... pairs) {
         ItemStack item = new ItemStack(type);
         ItemMeta m = item.getItemMeta();
@@ -1104,53 +1171,52 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         return item;
     }
 
-    private ItemStack weaponFor(Role role) {
-        return switch (role) {
-            case CAPTAIN -> enchanted(Material.NETHERITE_SWORD,
-                    Enchantment.SHARPNESS, 6, Enchantment.UNBREAKING, 3, Enchantment.MENDING, 1,
-                    Enchantment.FIRE_ASPECT, 2, Enchantment.LOOTING, 3, Enchantment.KNOCKBACK, 2,
-                    Enchantment.SWEEPING_EDGE, 3);
+    private ItemStack weaponItem(Weapon w, Role role) {
+        return switch (w) {
             case AXE -> enchanted(Material.NETHERITE_AXE,
-                    Enchantment.SHARPNESS, 5, Enchantment.EFFICIENCY, 5, Enchantment.UNBREAKING, 3,
-                    Enchantment.MENDING, 1, Enchantment.FIRE_ASPECT, 2);
-            case ARCHER -> enchanted(Material.BOW,
-                    Enchantment.POWER, 5, Enchantment.PUNCH, 2, Enchantment.FLAME, 1,
-                    Enchantment.INFINITY, 1, Enchantment.UNBREAKING, 3);
+                    Enchantment.SHARPNESS, 10, Enchantment.EFFICIENCY, 5, Enchantment.UNBREAKING, 5,
+                    Enchantment.MENDING, 1, Enchantment.FIRE_ASPECT, 3);
+            case BOW -> enchanted(Material.BOW,
+                    Enchantment.POWER, 10, Enchantment.PUNCH, 3, Enchantment.FLAME, 1,
+                    Enchantment.INFINITY, 1, Enchantment.UNBREAKING, 5);
+            case MACE -> enchanted(Material.MACE,
+                    Enchantment.DENSITY, 8, Enchantment.WIND_BURST, 3, Enchantment.FIRE_ASPECT, 3,
+                    Enchantment.UNBREAKING, 5, Enchantment.MENDING, 1);
             default -> enchanted(Material.NETHERITE_SWORD,
-                    Enchantment.SHARPNESS, 5, Enchantment.UNBREAKING, 3, Enchantment.MENDING, 1,
-                    Enchantment.FIRE_ASPECT, 2, Enchantment.LOOTING, 3, Enchantment.KNOCKBACK, 2,
-                    Enchantment.SWEEPING_EDGE, 3);
+                    Enchantment.SHARPNESS, role == Role.CAPTAIN ? 15 : 10, Enchantment.UNBREAKING, 5,
+                    Enchantment.MENDING, 1, Enchantment.FIRE_ASPECT, 3, Enchantment.LOOTING, 5,
+                    Enchantment.KNOCKBACK, 2, Enchantment.SWEEPING_EDGE, 5);
         };
     }
 
-    private ItemStack maceItem() {
-        return enchanted(Material.MACE,
-                Enchantment.DENSITY, 5, Enchantment.WIND_BURST, 3, Enchantment.FIRE_ASPECT, 2,
-                Enchantment.UNBREAKING, 3, Enchantment.MENDING, 1);
+    private ItemStack elytraItem() {
+        return enchanted(Material.ELYTRA, Enchantment.UNBREAKING, 5, Enchantment.MENDING, 1);
     }
 
-    private ItemStack elytraItem() {
-        return enchanted(Material.ELYTRA, Enchantment.UNBREAKING, 3, Enchantment.MENDING, 1);
+    // every protection at level 5 caps the damage reduction at its maximum
+    private ItemStack armorPiece(Material type, Object... extra) {
+        Object[] base = {
+                Enchantment.PROTECTION, 5, Enchantment.BLAST_PROTECTION, 5,
+                Enchantment.PROJECTILE_PROTECTION, 5, Enchantment.FIRE_PROTECTION, 5,
+                Enchantment.UNBREAKING, 5, Enchantment.MENDING, 1, Enchantment.THORNS, 5};
+        Object[] all = new Object[base.length + extra.length];
+        System.arraycopy(base, 0, all, 0, base.length);
+        System.arraycopy(extra, 0, all, base.length, extra.length);
+        return enchanted(type, all);
     }
 
     private ItemStack chestplate() {
-        return enchanted(Material.NETHERITE_CHESTPLATE,
-                Enchantment.PROTECTION, 4, Enchantment.UNBREAKING, 3, Enchantment.MENDING, 1,
-                Enchantment.THORNS, 3);
+        return armorPiece(Material.NETHERITE_CHESTPLATE);
     }
 
     private void equipArmor(Equipment eq) {
-        eq.set(Equipment.EquipmentSlot.HELMET, enchanted(Material.NETHERITE_HELMET,
-                Enchantment.PROTECTION, 4, Enchantment.UNBREAKING, 3, Enchantment.MENDING, 1,
-                Enchantment.THORNS, 3, Enchantment.RESPIRATION, 3, Enchantment.AQUA_AFFINITY, 1));
+        eq.set(Equipment.EquipmentSlot.HELMET, armorPiece(Material.NETHERITE_HELMET,
+                Enchantment.RESPIRATION, 3, Enchantment.AQUA_AFFINITY, 1));
         eq.set(Equipment.EquipmentSlot.CHESTPLATE, chestplate());
-        eq.set(Equipment.EquipmentSlot.LEGGINGS, enchanted(Material.NETHERITE_LEGGINGS,
-                Enchantment.PROTECTION, 4, Enchantment.UNBREAKING, 3, Enchantment.MENDING, 1,
-                Enchantment.THORNS, 3, Enchantment.SWIFT_SNEAK, 3));
-        eq.set(Equipment.EquipmentSlot.BOOTS, enchanted(Material.NETHERITE_BOOTS,
-                Enchantment.PROTECTION, 4, Enchantment.UNBREAKING, 3, Enchantment.MENDING, 1,
-                Enchantment.THORNS, 3, Enchantment.FEATHER_FALLING, 4, Enchantment.DEPTH_STRIDER, 3,
-                Enchantment.SOUL_SPEED, 3));
+        eq.set(Equipment.EquipmentSlot.LEGGINGS, armorPiece(Material.NETHERITE_LEGGINGS,
+                Enchantment.SWIFT_SNEAK, 3));
+        eq.set(Equipment.EquipmentSlot.BOOTS, armorPiece(Material.NETHERITE_BOOTS,
+                Enchantment.FEATHER_FALLING, 5, Enchantment.DEPTH_STRIDER, 3, Enchantment.SOUL_SPEED, 3));
     }
 
     // elytra-mace style = elytra + mace, normal style = netherite chestplate + sword
@@ -1158,7 +1224,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         if (!npc.isSpawned()) return;
         Equipment eq = npc.getOrAddTrait(Equipment.class);
         eq.set(Equipment.EquipmentSlot.CHESTPLATE, elytraMace ? elytraItem() : chestplate());
-        eq.set(Equipment.EquipmentSlot.HAND, elytraMace ? maceItem() : weaponFor(Role.SWORD));
+        eq.set(Equipment.EquipmentSlot.HAND, weaponItem(elytraMace ? Weapon.MACE : Weapon.SWORD, Role.MACE));
     }
 
     // names like "Xgafdiwn12": capital letter, lowercase letters, then 1-2 digits
@@ -1360,8 +1426,9 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         army.captain = getConfig().getBoolean("army.captain", true);
         army.formation = formations.getOrDefault(owner.getUniqueId(), configFormation());
 
+        // whatever you just fought is already on the target list
         LivingEntity first = recentTarget(owner);
-        army.targetId = first == null ? null : first.getUniqueId();
+        if (first != null) army.threats.put(first.getUniqueId(), System.currentTimeMillis());
         armies.put(owner.getUniqueId(), army);
         owner.getWorld().playSound(owner.getLocation(), Sound.ENTITY_WITHER_SPAWN, 0.6f, 1.4f);
 
@@ -1406,6 +1473,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
     private void spawnOne(Player owner, Army army, Location at, int forcedIndex) {
         int index = forcedIndex >= 0 ? forcedIndex : army.npcs.size();
         Role role = roleFor(army, index);
+        Weapon startWeapon = role == Role.ARCHER ? Weapon.BOW : Weapon.SWORD;
 
         String name = gibberishName();
         if (role == Role.CAPTAIN) name = "\u00a7c" + name;   // red name for the captain
@@ -1414,7 +1482,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         npc.setProtected(false); // can be killed
 
         Equipment eq = npc.getOrAddTrait(Equipment.class);
-        eq.set(Equipment.EquipmentSlot.HAND, weaponFor(role));
+        eq.set(Equipment.EquipmentSlot.HAND, weaponItem(startWeapon, role));
         if (getConfig().getBoolean("army.armor", true) || role == Role.MACE) equipArmor(eq);
 
         // looks at nearby players like a real player would
@@ -1433,19 +1501,27 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         if (npc.getEntity() instanceof LivingEntity le) {
             boolean cap = role == Role.CAPTAIN;
             if (getConfig().getBoolean("army.effects", true)) {
-                le.addPotionEffect(new PotionEffect(PotionEffectType.STRENGTH, PotionEffect.INFINITE_DURATION, cap ? 2 : 1, false, false));
-                le.addPotionEffect(new PotionEffect(PotionEffectType.RESISTANCE, PotionEffect.INFINITE_DURATION, cap ? 1 : 0, false, false));
+                int str = Math.max(1, getConfig().getInt("army.strength-level", 3));
+                int res = Math.max(1, getConfig().getInt("army.resistance-level", 2));
+                le.addPotionEffect(new PotionEffect(PotionEffectType.STRENGTH, PotionEffect.INFINITE_DURATION,
+                        str - 1 + (cap ? 1 : 0), false, false));
+                le.addPotionEffect(new PotionEffect(PotionEffectType.RESISTANCE, PotionEffect.INFINITE_DURATION,
+                        res - 1 + (cap ? 1 : 0), false, false));
+                le.addPotionEffect(new PotionEffect(PotionEffectType.REGENERATION, PotionEffect.INFINITE_DURATION,
+                        0, false, false));
                 if (cap) {
-                    le.addPotionEffect(new PotionEffect(PotionEffectType.SPEED, PotionEffect.INFINITE_DURATION, 0, false, false));
+                    le.addPotionEffect(new PotionEffect(PotionEffectType.SPEED, PotionEffect.INFINITE_DURATION, 1, false, false));
                 }
             }
-            if (cap) {
-                AttributeInstance maxHealth = le.getAttribute(Attribute.MAX_HEALTH);
-                if (maxHealth != null) {
-                    maxHealth.setBaseValue(60);
-                    le.setHealth(60);
-                }
+            double hp = getConfig().getDouble("army.health", 40.0) * (cap ? 2.5 : 1.0);
+            AttributeInstance maxHealth = le.getAttribute(Attribute.MAX_HEALTH);
+            if (maxHealth != null) {
+                maxHealth.setBaseValue(hp);
+                le.setHealth(hp);
             }
+            AttributeInstance knockback = le.getAttribute(Attribute.KNOCKBACK_RESISTANCE);
+            if (knockback != null) knockback.setBaseValue(cap ? 1.0 : 0.6);
+
             npcOwner.put(le.getUniqueId(), owner.getUniqueId());
             army.byEntity.put(le.getUniqueId(), npc);
         }
@@ -1460,6 +1536,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
             army.npcs.add(npc);
         }
         army.roles.put(npc, role);
+        army.weapon.put(npc, startWeapon);
 
         spawnAt.getWorld().playSound(spawnAt, Sound.ENTITY_ENDERMAN_TELEPORT, 0.5f, 1.2f);
         if (at != null) {
@@ -1493,7 +1570,12 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         army.stuck.remove(dead);
         army.idle.remove(dead);
         army.climbUntil.remove(dead);
-        army.huntTarget.remove(dead);
+        army.assigned.remove(dead);
+        army.switchUntil.remove(dead);
+        army.weapon.remove(dead);
+        army.swapReady.remove(dead);
+        army.windReady.remove(dead);
+        army.maceFails.remove(dead);
         army.lastPos.remove(dead);
         army.lastDest.remove(dead);
         army.focus.remove(dead);
@@ -1523,14 +1605,53 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         }, delay);
     }
 
-    // new army target (or null = no target: follow the owner / hold the rally point)
-    private void command(Player owner, Army army, LivingEntity target) {
-        army.targetId = target == null ? null : target.getUniqueId();
-        army.engaged.clear();
-        army.lastDest.clear();
-        for (NPC npc : army.npcs) {
-            if (npc.isSpawned() && !army.flights.containsKey(npc)) steerOne(owner, army, npc, targetFor(owner, army, npc));
+    // below 30% health a NULL eats a golden-apple-style heal (once every 25 s)
+    private void secondWind(Army army, NPC npc) {
+        if (!(npc.getEntity() instanceof LivingEntity le)) return;
+        AttributeInstance mh = le.getAttribute(Attribute.MAX_HEALTH);
+        double max = mh != null ? mh.getValue() : 20.0;
+        long now = System.currentTimeMillis();
+        if (le.getHealth() > max * 0.3 || now < army.windReady.getOrDefault(npc, 0L)) return;
+
+        army.windReady.put(npc, now + 25_000);
+        le.setHealth(Math.min(max, le.getHealth() + max * 0.5));
+        le.addPotionEffect(new PotionEffect(PotionEffectType.ABSORPTION, 200, 1, false, false));
+        Location l = le.getLocation();
+        l.getWorld().playSound(l, Sound.ENTITY_GENERIC_EAT, 1f, 1f);
+        l.getWorld().spawnParticle(Particle.HEART, l.clone().add(0, 2, 0), 6, 0.4, 0.3, 0.4, 0);
+    }
+
+    // swaps to the best weapon for the situation (max once every 2 s)
+    private void chooseWeapon(Army army, NPC npc, LivingEntity target, Location here) {
+        Weapon cur = army.weapon.getOrDefault(npc, Weapon.SWORD);
+        if (cur == Weapon.MACE) return;                                   // mid-dive: flightTick handles it
+        long now = System.currentTimeMillis();
+        if (now < army.swapReady.getOrDefault(npc, 0L)) return;
+        if (!here.getWorld().equals(target.getWorld())) return;
+
+        double d = here.distance(target.getLocation());
+        Role role = army.roles.getOrDefault(npc, Role.SWORD);
+
+        boolean airborne = target.isGliding() || target instanceof Flying
+                || (target instanceof Player p && p.isFlying());
+        boolean shielded = target instanceof Player p2 && p2.isBlocking();
+
+        Weapon want;
+        if (airborne && d >= 6) {
+            want = Weapon.BOW;                                            // shoot what flies
+        } else if (role == Role.ARCHER) {
+            want = d >= (cur == Weapon.BOW ? 4 : 9) ? Weapon.BOW : Weapon.SWORD;   // archers kite, then fight close
+        } else if (shielded && d <= 6) {
+            want = Weapon.AXE;                                            // axes break shields
+        } else {
+            want = Weapon.SWORD;
         }
+        if (want == cur) return;
+
+        army.weapon.put(npc, want);
+        army.swapReady.put(npc, now + 2000);
+        npc.getOrAddTrait(Equipment.class).set(Equipment.EquipmentSlot.HAND, weaponItem(want, role));
+        here.getWorld().playSound(here, Sound.ITEM_ARMOR_EQUIP_NETHERITE, 0.5f, 1.4f);
     }
 
     // runs every 0.25s
@@ -1546,34 +1667,37 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
             army.rally.getWorld().spawnParticle(Particle.PORTAL, army.rally.clone().add(0, 0.6, 0), 10, 0.4, 0.4, 0.4, 0.2);
         }
 
-        LivingEntity armyTarget = liveTarget(owner, army.targetId);
-        if (army.targetId != null && armyTarget == null) {
-            command(owner, army, null);                 // target died / left
-        }
-
         missionTick(owner, army);                       // /nulltarget: gather, go through the portal, hunt
 
-        // hunt mode: look around the owner once, then every NULL picks its own prey
+        // hunt mode: look around the owner once
         List<LivingEntity> huntables = army.hunting ? scanHuntables(owner) : null;
         if (army.hunting && army.ticks % 20 == 0) {
             owner.sendActionBar(Component.text("NULL hunting: " + huntables.size() + " in range", NamedTextColor.DARK_RED));
         }
 
+        // who is fighting whom, so each NULL can pick a target nobody is crowding
+        List<LivingEntity> cands = candidates(owner, army, huntables);
+        Map<UUID, Integer> load = new HashMap<>();
+        for (UUID id : army.assigned.values()) load.merge(id, 1, Integer::sum);
+
         long now = System.currentTimeMillis();
         boolean breakOn = getConfig().getBoolean("army.break-blocks", true);
+        boolean wind = getConfig().getBoolean("army.second-wind", true);
 
         for (NPC npc : army.npcs) {
             if (!npc.isSpawned()) continue;
+            if (wind) secondWind(army, npc);
             if (army.flights.containsKey(npc)) continue;   // in the air: flightTick drives it
             if (army.busy.contains(npc)) continue;         // carrying out an order / travelling
 
             // the /nulltarget player beats everything else for NULL that came through the portal
             LivingEntity missionT = army.mission != null && army.mission.arrived.contains(npc)
                     ? missionTarget(owner, army.mission) : null;
-            LivingEntity target = missionT != null ? missionT
-                    : (army.hunting ? assignHunt(owner, army, npc, huntables, armyTarget) : armyTarget);
+            LivingEntity target = missionT != null ? missionT : assignTarget(owner, army, npc, cands, load);
 
             Location here = npc.getEntity().getLocation();
+            if (target != null) chooseWeapon(army, npc, target, here);
+
             if (target != null && army.roles.get(npc) == Role.MACE
                     && maybeLaunch(owner, army, npc, here, target)) {
                 continue;
@@ -1615,7 +1739,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
                 continue;
             }
             LivingEntity target = targetFor(owner, army, npc);
-            if (target != null && army.engaged.contains(npc) && army.roles.get(npc) != Role.ARCHER) {
+            if (target != null && army.engaged.contains(npc) && army.weapon.get(npc) != Weapon.BOW) {
                 Location here = npc.getEntity().getLocation();
                 if (here.getWorld().equals(target.getWorld())
                         && here.distanceSquared(target.getLocation()) <= 64) {
@@ -1963,20 +2087,43 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
 
     // ---------- elytra-mace flight ----------
 
+    // a longer wait after every failed dive: 6 s, 12 s, 24 s, then 30 s
+    private void maceBackoff(Army army, NPC npc) {
+        int fails = army.maceFails.merge(npc, 1, Integer::sum);
+        long ms = Math.min(30_000L, 3_000L * (1L << Math.min(fails, 3)));
+        army.maceReady.put(npc, System.currentTimeMillis() + ms);
+    }
+
     // a far-away target: swap to elytra + mace and take off (true = it is now flying)
     private boolean maybeLaunch(Player owner, Army army, NPC npc, Location here, LivingEntity target) {
         if (!getConfig().getBoolean("army.mace-elytra", true)) return false;
         long now = System.currentTimeMillis();
         if (now < army.maceReady.getOrDefault(npc, 0L)) return false;
         if (!here.getWorld().equals(target.getWorld())) return false;
+        if (here.getBlock().isLiquid()) return false;
 
         double d = here.distance(target.getLocation());
         if (d < MACE_LAUNCH_MIN || d > MACE_LAUNCH_MAX) return false;
 
-        // needs open sky above to take off
-        for (int i = 1; i <= 6; i++) {
+        // needs open sky above to climb
+        double dive = getConfig().getDouble("army.mace-dive-height", 14.0);
+        int climb = (int) Math.min(20, Math.ceil(dive));
+        for (int i = 1; i <= climb; i++) {
             if (!here.getBlock().getRelative(BlockFace.UP, i).isPassable()) {
                 army.maceReady.put(npc, now + 3000);
+                return false;
+            }
+        }
+
+        // and a clear line from the top of the climb down to the target
+        Location top = here.clone().add(0, climb, 0);
+        Vector dir = target.getEyeLocation().toVector().subtract(top.toVector());
+        double dist = dir.length();
+        if (dist > 0.5) {
+            RayTraceResult hit = here.getWorld().rayTraceBlocks(top, dir.normalize(), dist,
+                    FluidCollisionMode.NEVER, true);
+            if (hit != null) {
+                maceBackoff(army, npc);
                 return false;
             }
         }
@@ -1987,12 +2134,29 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         army.stuck.remove(npc);
         army.idle.remove(npc);
         equipStyle(npc, true);
+        army.weapon.put(npc, Weapon.MACE);
 
         Flight f = new Flight();
         f.apexY = here.getY();
         army.flights.put(npc, f);
         here.getWorld().playSound(here, Sound.ENTITY_FIREWORK_ROCKET_LAUNCH, 1f, 1f);
         return true;
+    }
+
+    // the closest enemy near a point (used when the dive target died in the air)
+    private LivingEntity nearestEnemy(Player owner, Army army, Location from, double r) {
+        LivingEntity best = null;
+        double bestD = Double.MAX_VALUE;
+        for (Entity e : from.getWorld().getNearbyEntities(from, r, r, r)) {
+            if (!(e instanceof LivingEntity le) || !canTarget(owner, le)) continue;
+            if (!army.hunting && !army.threats.containsKey(le.getUniqueId())) continue;
+            double d = le.getLocation().distanceSquared(from);
+            if (d < bestD) {
+                bestD = d;
+                best = le;
+            }
+        }
+        return best;
     }
 
     // runs every tick: moves every NULL that is in the air
@@ -2009,13 +2173,17 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
                 continue;
             }
 
-            LivingEntity target = targetFor(owner, army, npc);
             Entity ne = npc.getEntity();
             Location cur = ne.getLocation();
             f.ticks++;
 
+            LivingEntity target = targetFor(owner, army, npc);
+            if (target == null) {                                   // the target died: dive on someone else nearby
+                target = nearestEnemy(owner, army, cur, 30);
+                if (target != null) army.assigned.put(npc, target.getUniqueId());
+            }
             if (target == null || f.ticks > MACE_FLIGHT_MAX_TICKS) {
-                endFlight(army, npc, null, false);
+                endFlight(army, npc, cur, false);                   // nothing to hit: land
                 continue;
             }
 
@@ -2044,9 +2212,9 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
             Location next = cur.clone().add(move);
             next.setDirection(move);
 
-            // blocked by a wall or roof: crash-land without damage
+            // blocked by a wall or roof: land where it is and wait a bit longer before trying again
             if (!next.getBlock().isPassable() || !next.clone().add(0, 1, 0).getBlock().isPassable()) {
-                endFlight(army, npc, null, false);
+                endFlight(army, npc, cur, false);
                 continue;
             }
 
@@ -2067,8 +2235,8 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         double bonus = Math.min(fall, 3) * 4
                 + Math.min(Math.max(fall - 3, 0), 5) * 2
                 + Math.max(fall - 8, 0);
-        double density = 0.5 * 5 * fall;                       // Density V
-        double max = getConfig().getDouble("army.mace-max-damage", 40.0);
+        double density = 0.5 * 8 * fall;                       // Density VIII
+        double max = getConfig().getDouble("army.mace-max-damage", 50.0);
         double dmg = Math.min(max, 6 + bonus + density);
 
         target.damage(dmg, attacker);
@@ -2085,6 +2253,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         w.spawnParticle(Particle.CLOUD, at.clone().add(0, 0.3, 0), 40, 1.0, 0.2, 1.0, 0.1);
         w.spawnParticle(Particle.CRIT, at.clone().add(0, 1, 0), 30, 0.6, 0.6, 0.6, 0.3);
 
+        army.maceFails.put(npc, 0);
         endFlight(army, npc, at, true);
     }
 
@@ -2107,7 +2276,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         return null;
     }
 
-    // landed (or crashed): back on the ground, switch back to the normal style
+    // landed (after a hit) or came down (nothing to hit / blocked): back on the ground with the sword again
     private void endFlight(Army army, NPC npc, Location landAt, boolean smashed) {
         army.flights.remove(npc);
         if (!npc.isSpawned()) return;
@@ -2117,15 +2286,21 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         ne.setFallDistance(0f);
 
         if (landAt != null) {
-            Location land = groundBelow(landAt).add(1, 0, 0);
-            if (!land.getBlock().isPassable()) land.subtract(1, 0, 0);
+            Location land = groundBelow(landAt);
+            if (smashed) {
+                land.add(1, 0, 0);                                  // next to the target, not inside it
+                if (!land.getBlock().isPassable()) land.subtract(1, 0, 0);
+            }
             npc.teleport(land, PlayerTeleportEvent.TeleportCause.PLUGIN);
         }
 
-        long cooldownMs = smashed
-                ? (long) (getConfig().getDouble("army.mace-cooldown-seconds", 10.0) * 1000)
-                : 4000L;
-        army.maceReady.put(npc, System.currentTimeMillis() + cooldownMs);
+        if (smashed) {
+long cooldownMs = (long) (getConfig().getDouble("army.mace-cooldown-seconds", 8.0) * 1000);
+            army.maceReady.put(npc, System.currentTimeMillis() + cooldownMs);
+        } else {
+            maceBackoff(army, npc);
+        }
+        army.weapon.put(npc, Weapon.SWORD);
         army.lastDest.remove(npc);
         army.engaged.remove(npc);
 
@@ -2142,14 +2317,14 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         Navigator nav = npc.getNavigator();
         Location here = npc.getEntity().getLocation();
         int index = Math.max(0, army.npcs.indexOf(npc));
-        Role role = army.roles.getOrDefault(npc, Role.SWORD);
+        Weapon weapon = army.weapon.getOrDefault(npc, Weapon.SWORD);
 
         if (target != null) {
             Location tl = target.getLocation();
             if (!here.getWorld().equals(tl.getWorld())) return;   // checkStuck() teleports it over
             double d = here.distance(tl);
 
-            if (role == Role.ARCHER) {
+            if (weapon == Weapon.BOW) {
                 steerArcher(army, npc, nav, here, tl, d, target, index);
                 return;
             }
@@ -2190,7 +2365,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         walkTo(army, npc, nav, here, slot(army, center, index, false));
     }
 
-    // archers stop at range and shoot instead of running into melee
+    // a NULL holding a bow stops at range and shoots instead of running into melee
     private void steerArcher(Army army, NPC npc, Navigator nav, Location here, Location tl, double d,
                              LivingEntity target, int index) {
         if (npc.getEntity() instanceof LivingEntity me && d <= ARCHER_RANGE && me.hasLineOfSight(target)) {
@@ -2223,7 +2398,7 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         Arrow arrow = me.getWorld().spawnArrow(eye, dir, 3.0f, 1.0f, Arrow.class);
         arrow.setShooter(me);
         arrow.setCritical(true);
-        arrow.setDamage(ARROW_DAMAGE);
+        arrow.setDamage(getConfig().getDouble("army.arrow-damage", 7.0));
         arrow.setFireTicks(100);                      // flame
         arrow.setPickupStatus(AbstractArrow.PickupStatus.DISALLOWED);
         me.getWorld().playSound(eye, Sound.ENTITY_ARROW_SHOOT, 1f, 1f);
@@ -2266,8 +2441,8 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
 
         Location last = army.lastPos.put(npc, here.clone());
 
-        // an archer standing still and shooting is not stuck
-        if (target != null && army.roles.get(npc) == Role.ARCHER && npc.getEntity() instanceof LivingEntity me
+        // a NULL standing still and shooting is not stuck
+        if (target != null && army.weapon.get(npc) == Weapon.BOW && npc.getEntity() instanceof LivingEntity me
                 && here.distanceSquared(to) <= ARCHER_RANGE * ARCHER_RANGE && me.hasLineOfSight(target)) {
             army.stuck.put(npc, 0);
             army.idle.put(npc, 0);
@@ -2467,7 +2642,6 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
         Army army = armies.remove(ownerId);
         if (army == null) return;
         army.dismissed = true;
-        army.mission = null;   // a /nulltarget mission ends with the army (its portals are closed below)
         if (army.task != null) army.task.cancel();
         if (army.spawnTask != null) army.spawnTask.cancel();
         if (army.lookTask != null) army.lookTask.cancel();
@@ -2502,4 +2676,4 @@ public class TotemNull extends JavaPlugin implements Listener, CommandExecutor {
     public void onDeath(PlayerDeathEvent e) {
         dismiss(e.getPlayer().getUniqueId(), false);
     }
-}
+                              }
