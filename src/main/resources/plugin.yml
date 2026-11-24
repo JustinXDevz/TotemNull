@@ -36,6 +36,15 @@ commands:
     usage: /nullgo <player>
     aliases: [nullportal]
     permission: totemnull.go
+  orbitalnull:
+    description: Get a one-use rod that drops 15 pearls from the sky, NULL steps out of each
+    usage: /orbitalnull [player]
+    aliases: [orbital]
+    permission: totemnull.reinforce
+  portalnull:
+    description: Get a one-use rod that opens 15 portals, NULL walks out of each
+    usage: /portalnull [player]
+    permission: totemnull.reinforce
 permissions:
   totemnull.give:
     description: Allows /totemnull
@@ -45,4 +54,7 @@ permissions:
     default: true
   totemnull.go:
     description: Allows /nullgo
+    default: op
+  totemnull.reinforce:
+    description: Allows /orbitalnull, /portalnull and using the rods
     default: op
